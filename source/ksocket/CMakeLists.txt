@@ -1,0 +1,1 @@
+target_sources(plato PRIVATE berkeley.c ksocket.c)

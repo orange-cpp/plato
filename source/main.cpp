@@ -211,11 +211,9 @@ static bool HandlePacket(BasePacket* pPacket, int client_sockfd)
     {
         case OPERATION::READ:
         {
-            VIRTUALIZER_FALCON_TINY_START
             auto pReadParam = static_cast<ReadMemoryOperation*>(pPacket);
             HandleReadOperation(pReadParam, client_sockfd);
 
-            VIRTUALIZER_FALCON_TINY_END
             return true;
         }
         case OPERATION::WRITE:

@@ -64,6 +64,9 @@ void CodeVirtualizerStealthArea()
     STEALTH_AREA_CHUNK
     STEALTH_AREA_CHUNK
     STEALTH_AREA_CHUNK
+    STEALTH_AREA_CHUNK
+    STEALTH_AREA_CHUNK
+    STEALTH_AREA_CHUNK
     STEALTH_AREA_END
 }
 
@@ -208,30 +211,38 @@ static bool HandlePacket(BasePacket* pPacket, int client_sockfd)
     {
         case OPERATION::READ:
         {
+            VIRTUALIZER_FALCON_TINY_START
             auto pReadParam = static_cast<ReadMemoryOperation*>(pPacket);
             HandleReadOperation(pReadParam, client_sockfd);
+
+            VIRTUALIZER_FALCON_TINY_END
             return true;
         }
         case OPERATION::WRITE:
         {
+            VIRTUALIZER_FALCON_TINY_START
             auto pWriteParam = static_cast<ReadMemoryOperation*>(pPacket);
             HandleWriteOperation(pWriteParam, client_sockfd);
+            VIRTUALIZER_FALCON_TINY_END
             return true;
         }
         case OPERATION::PROCESS_BASE:
         {
+            VIRTUALIZER_FALCON_TINY_START
             auto pBaseParam = static_cast<ReadMemoryOperation*>(pPacket);
             HandleProcessBaseOperation(pBaseParam, client_sockfd);
+            VIRTUALIZER_FALCON_TINY_END
             return true;
         }
     }
+    VIRTUALIZER_FALCON_TINY_START
     // Unknown operation: send failure response
     constexpr bool bStatus = false;
     constexpr size_t szStatusSize = sizeof(bStatus);
 
     send(client_sockfd, &szStatusSize, sizeof(szStatusSize), 0);
     send(client_sockfd, &bStatus, 1, 0);
-
+    VIRTUALIZER_FALCON_TINY_END
     return false;
 }
 

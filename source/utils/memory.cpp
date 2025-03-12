@@ -1,6 +1,7 @@
 #include "memory.h"
-
 #include <VirtualizerSDK.h>
+#include <climits>
+#include <cstdint>
 #include <ntddk.h>
 #include <ntdef.h>
 #include <ntifs.h>
@@ -48,6 +49,12 @@ extern "C" NTSTATUS ZwQuerySystemInformation(ULONG InfoClass, PVOID Buffer, ULON
 extern "C" NTKERNELAPI PVOID NTAPI RtlFindExportedRoutineByName(_In_ PVOID ImageBase, _In_ PCCH RoutineName);
 extern "C" NTKERNELAPI PVOID PsGetProcessSectionBaseAddress(__in PEPROCESS Process);
 
+extern "C"   NTKERNELAPI  NTSTATUS ZwProtectVirtualMemory (
+        IN HANDLE ProcessHandle,
+        IN OUT PVOID* BaseAddress,
+        IN OUT SIZE_T* NumberOfBytesToProtect,
+        IN ULONG NewAccessProtection,
+        OUT PULONG OldAccessProtection );
 struct memcpy_structure
 {
     void* destination;
@@ -84,8 +91,9 @@ typedef struct _SYSTEM_MODULE_INFORMATION
 NTSTATUS GetNtoskrnlBaseAddress(OUT PVOID* pBaseAddress)
 {
     if (!pBaseAddress)
+    {
         return STATUS_INVALID_PARAMETER;
-
+    }
 
     *pBaseAddress = nullptr;
 
@@ -96,8 +104,10 @@ NTSTATUS GetNtoskrnlBaseAddress(OUT PVOID* pBaseAddress)
     // First call ZwQuerySystemInformation with a NULL buffer to get size needed.
     //
     NTSTATUS status = ZwQuerySystemInformation(SystemModuleInformation, nullptr, 0, &bufferSize);
+
     if (status != STATUS_INFO_LENGTH_MISMATCH)
-        return status;
+        return status; // Some error other than "needs more space"
+
 
     //
     // Allocate enough space for the module information.
@@ -105,7 +115,6 @@ NTSTATUS GetNtoskrnlBaseAddress(OUT PVOID* pBaseAddress)
     pModuleInfo = (PSYSTEM_MODULE_INFORMATION) ExAllocatePoolWithTag(NonPagedPool, bufferSize,
                                                                      'ldoM' // A simple pool tag, e.g. "M0dl"
     );
-
     if (!pModuleInfo)
         return STATUS_INSUFFICIENT_RESOURCES;
 
@@ -128,7 +137,6 @@ NTSTATUS GetNtoskrnlBaseAddress(OUT PVOID* pBaseAddress)
     if (pModuleInfo->Count > 0)
         *pBaseAddress = pModuleInfo->Module[0].ImageBase;
 
-
     //
     // Cleanup
     //
@@ -138,7 +146,6 @@ NTSTATUS GetNtoskrnlBaseAddress(OUT PVOID* pBaseAddress)
 
 NTSTATUS read_memory(PEPROCESS target_process, void* source, void* target, size_t size)
 {
-    VIRTUALIZER_FALCON_TINY_START;
     KAPC_STATE ApcState;
     KeStackAttachProcess(target_process, &ApcState);
 
@@ -157,9 +164,11 @@ NTSTATUS read_memory(PEPROCESS target_process, void* source, void* target, size_
     if (!base)
         return STATUS_UNSUCCESSFUL;
 
-    static auto func = (PiDqSerializationWrite_t) (base + 0x9FFDE0);
 
-    func(&_, source, (unsigned int) size);
+
+    static auto func = reinterpret_cast<PiDqSerializationWrite_t>(base + 0x9F99F0);
+
+    func(&_, source, static_cast<unsigned int>(size));
 
     if (_.error_flag)
     {
@@ -169,16 +178,53 @@ NTSTATUS read_memory(PEPROCESS target_process, void* source, void* target, size_
 
     KeUnstackDetachProcess(&ApcState);
 
-    VIRTUALIZER_FALCON_TINY_END;
     return STATUS_SUCCESS;
 }
+NTSTATUS write_memory(PEPROCESS target_process, void* source, void* target, size_t size)
+{
+    KAPC_STATE ApcState;
+    // Attach to the target process's context.
+    KeStackAttachProcess(target_process, &ApcState);
 
+    // Prepare the memory copy structure.
+    memcpy_structure mem_op = {0};
+    // For writing, 'target' is now the destination in the target process.
+    mem_op.destination = target;
+    mem_op.max_size    = 0xFFFFFFFF;
+    mem_op.offset      = 0;
+    memset(mem_op.pad, 0, sizeof(mem_op.pad));
+    mem_op.error_flag  = 0;
+
+    static uintptr_t base = 0;
+    if (!base)
+        GetNtoskrnlBaseAddress(reinterpret_cast<void**>(&base));
+
+    if (!base)
+    {
+        KeUnstackDetachProcess(&ApcState);
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    // Obtain the kernel memcpy helper. (Using the same offset as the read function.)
+    static auto func = reinterpret_cast<PiDqSerializationWrite_t>(base + 0x9F99F0);
+
+    // For writing, 'source' is our local buffer (the data to be written).
+    func(&mem_op, source, static_cast<unsigned int>(size));
+
+    if (mem_op.error_flag)
+    {
+        KeUnstackDetachProcess(&ApcState);
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    KeUnstackDetachProcess(&ApcState);
+    return STATUS_SUCCESS;
+}
 bool memory::ReadProcessVirtualMemory(HANDLE pid, PVOID address, PVOID buffer, SIZE_T size)
 {
     if (!address || !buffer || !size || !pid)
         return false;
 
-    SIZE_T bytes = 0;
     PEPROCESS process;
 
     if (!NT_SUCCESS(PsLookupProcessByProcessId(pid, &process)))
@@ -186,21 +232,52 @@ bool memory::ReadProcessVirtualMemory(HANDLE pid, PVOID address, PVOID buffer, S
 
     return NT_SUCCESS(read_memory(process, address, buffer, size));
 }
+
+
+NTSTATUS WriteToUserMemoryE(PEPROCESS TargetProcess, PVOID TargetAddress, PVOID Buffer, SIZE_T Size)
+{
+    KAPC_STATE apcState;
+    NTSTATUS status = STATUS_SUCCESS;
+
+    __try
+    {
+        // Attach to the target process's address space
+        KeStackAttachProcess(TargetProcess, &apcState);
+
+        // Change memory protection to allow writing
+        ULONG oldProtect;
+        status = ZwProtectVirtualMemory(ZwCurrentProcess(), &TargetAddress, &Size, PAGE_EXECUTE_READWRITE, &oldProtect);
+        if (!NT_SUCCESS(status))
+        {
+            __leave;
+        }
+
+        // Write the buffer to the target address
+        RtlCopyMemory(TargetAddress, Buffer, Size);
+
+        // Restore the original memory protection
+        ZwProtectVirtualMemory(ZwCurrentProcess(), &TargetAddress, &Size, oldProtect, &oldProtect);
+    }
+    __finally
+    {
+        // Detach from the target process's address space
+        KeUnstackDetachProcess(&apcState);
+    }
+
+    return status;
+}
+
 bool memory::WriteProcessVirtualMemory(HANDLE pid, PVOID sourceAddr, PVOID targetAddr, SIZE_T size)
 {
-    VIRTUALIZER_FALCON_TINY_START
     if (!sourceAddr || !targetAddr || !size)
         return false;
 
     PEPROCESS process;
-    SIZE_T bytes = 0;
+
     if (!NT_SUCCESS(PsLookupProcessByProcessId(pid, &process)))
         return false;
 
-    const auto res = MmCopyVirtualMemory(PsGetCurrentProcess(), sourceAddr, process, targetAddr, size, KernelMode, &bytes);
-
-    VIRTUALIZER_FALCON_TINY_END
-    return res;
+    return WriteToUserMemoryE(process, targetAddr, sourceAddr, size);
 }
 uintptr_t memory::GetProcessModuleBase(HANDLE pid)
 {

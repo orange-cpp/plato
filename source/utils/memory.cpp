@@ -234,50 +234,20 @@ bool memory::ReadProcessVirtualMemory(HANDLE pid, PVOID address, PVOID buffer, S
 }
 
 
-NTSTATUS WriteToUserMemoryE(PEPROCESS TargetProcess, PVOID TargetAddress, PVOID Buffer, SIZE_T Size)
-{
-    KAPC_STATE apcState;
-    NTSTATUS status = STATUS_SUCCESS;
-
-    __try
-    {
-        // Attach to the target process's address space
-        KeStackAttachProcess(TargetProcess, &apcState);
-
-        // Change memory protection to allow writing
-        ULONG oldProtect;
-        status = ZwProtectVirtualMemory(ZwCurrentProcess(), &TargetAddress, &Size, PAGE_EXECUTE_READWRITE, &oldProtect);
-        if (!NT_SUCCESS(status))
-        {
-            __leave;
-        }
-
-        // Write the buffer to the target address
-        RtlCopyMemory(TargetAddress, Buffer, Size);
-
-        // Restore the original memory protection
-        ZwProtectVirtualMemory(ZwCurrentProcess(), &TargetAddress, &Size, oldProtect, &oldProtect);
-    }
-    __finally
-    {
-        // Detach from the target process's address space
-        KeUnstackDetachProcess(&apcState);
-    }
-
-    return status;
-}
-
 bool memory::WriteProcessVirtualMemory(HANDLE pid, PVOID sourceAddr, PVOID targetAddr, SIZE_T size)
 {
     if (!sourceAddr || !targetAddr || !size)
         return false;
 
     PEPROCESS process;
-
+    uintptr_t bytes = 0;
     if (!NT_SUCCESS(PsLookupProcessByProcessId(pid, &process)))
         return false;
 
-    return WriteToUserMemoryE(process, targetAddr, sourceAddr, size);
+
+    const auto res = MmCopyVirtualMemory(PsGetCurrentProcess(), sourceAddr, process, targetAddr, size, KernelMode, &bytes);
+
+    return res;
 }
 uintptr_t memory::GetProcessModuleBase(HANDLE pid)
 {

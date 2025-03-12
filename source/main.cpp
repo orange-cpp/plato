@@ -249,7 +249,7 @@ static bool HandlePacket(BasePacket* pPacket, int client_sockfd)
 //--------------------------------------------------------------------------------------
 static void HandleReadOperation(ReadMemoryOperation* pReadParam, int client_sockfd)
 {
-
+    VIRTUALIZER_FALCON_TINY_START
     // Allocate buffer to hold the data we’ll read
     auto pSendBuffer = ExAllocatePoolWithTag(NonPagedPool, pReadParam->m_iSize, 'pac');
     if (!pSendBuffer)
@@ -266,7 +266,7 @@ static void HandleReadOperation(ReadMemoryOperation* pReadParam, int client_sock
     send(client_sockfd, pSendBuffer, pReadParam->m_iSize, 0);
 
     ExFreePoolWithTag(pSendBuffer, 0);
-
+    VIRTUALIZER_FALCON_TINY_END
 }
 
 //--------------------------------------------------------------------------------------

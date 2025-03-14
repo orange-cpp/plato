@@ -240,14 +240,11 @@ bool memory::WriteProcessVirtualMemory(HANDLE pid, PVOID sourceAddr, PVOID targe
         return false;
 
     PEPROCESS process;
-    uintptr_t bytes = 0;
+    SIZE_T bytes = 0;
     if (!NT_SUCCESS(PsLookupProcessByProcessId(pid, &process)))
         return false;
 
-
-    const auto res = MmCopyVirtualMemory(PsGetCurrentProcess(), sourceAddr, process, targetAddr, size, KernelMode, &bytes);
-
-    return res;
+    return NT_SUCCESS(MmCopyVirtualMemory(PsGetCurrentProcess(), sourceAddr, process, targetAddr, size, KernelMode, &bytes));
 }
 uintptr_t memory::GetProcessModuleBase(HANDLE pid)
 {

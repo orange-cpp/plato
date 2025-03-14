@@ -110,7 +110,6 @@ static void HandleProcessBaseOperation(ReadMemoryOperation* pBaseParam, int clie
 //--------------------------------------------------------------------------------------
 static int SetupServerSocket(uint16_t port)
 {
-    VIRTUALIZER_FALCON_TINY_START
     KsInitialize(); // Initialize your ksocket or other low-level network setup
 
     int server_sockfd = socket_listen(AF_INET, SOCK_STREAM, 0);
@@ -125,7 +124,6 @@ static int SetupServerSocket(uint16_t port)
     if (bind(server_sockfd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0)
         return -1;
 
-    VIRTUALIZER_FALCON_TINY_END
     return server_sockfd;
 }
 
@@ -218,29 +216,23 @@ static bool HandlePacket(BasePacket* pPacket, int client_sockfd)
         }
         case OPERATION::WRITE:
         {
-            VIRTUALIZER_FALCON_TINY_START
             auto pWriteParam = static_cast<ReadMemoryOperation*>(pPacket);
             HandleWriteOperation(pWriteParam, client_sockfd);
-            VIRTUALIZER_FALCON_TINY_END
             return true;
         }
         case OPERATION::PROCESS_BASE:
         {
-            VIRTUALIZER_FALCON_TINY_START
             auto pBaseParam = static_cast<ReadMemoryOperation*>(pPacket);
             HandleProcessBaseOperation(pBaseParam, client_sockfd);
-            VIRTUALIZER_FALCON_TINY_END
             return true;
         }
     }
-    VIRTUALIZER_FALCON_TINY_START
     // Unknown operation: send failure response
     constexpr bool bStatus = false;
     constexpr size_t szStatusSize = sizeof(bStatus);
 
     send(client_sockfd, &szStatusSize, sizeof(szStatusSize), 0);
     send(client_sockfd, &bStatus, 1, 0);
-    VIRTUALIZER_FALCON_TINY_END
     return false;
 }
 
@@ -249,7 +241,6 @@ static bool HandlePacket(BasePacket* pPacket, int client_sockfd)
 //--------------------------------------------------------------------------------------
 static void HandleReadOperation(ReadMemoryOperation* pReadParam, int client_sockfd)
 {
-    VIRTUALIZER_FALCON_TINY_START
     // Allocate buffer to hold the data we’ll read
     auto pSendBuffer = ExAllocatePoolWithTag(NonPagedPool, pReadParam->m_iSize, 'pac');
     if (!pSendBuffer)
@@ -266,7 +257,6 @@ static void HandleReadOperation(ReadMemoryOperation* pReadParam, int client_sock
     send(client_sockfd, pSendBuffer, pReadParam->m_iSize, 0);
 
     ExFreePoolWithTag(pSendBuffer, 0);
-    VIRTUALIZER_FALCON_TINY_END
 }
 
 //--------------------------------------------------------------------------------------
@@ -282,11 +272,9 @@ static void HandleWriteOperation(ReadMemoryOperation* pWriteParam, int client_so
     // Receive data that needs to be written to the target process memory
     recv(client_sockfd, pWriteBuffer, pWriteParam->m_iSize, 0);
 
-    memory::WriteProcessVirtualMemory(reinterpret_cast<HANDLE>(pWriteParam->m_procId), pWriteBuffer,
+    const bool bStatus = memory::WriteProcessVirtualMemory(reinterpret_cast<HANDLE>(pWriteParam->m_procId), pWriteBuffer,
                                       reinterpret_cast<PVOID>(pWriteParam->m_addr), pWriteParam->m_iSize);
 
-    // Send a success response
-    constexpr bool bStatus = true;
     constexpr size_t szStatusSize = sizeof(bStatus);
 
     send(client_sockfd, &szStatusSize, sizeof(szStatusSize), 0);
@@ -336,7 +324,6 @@ extern "C" DRIVER_INITIALIZE DriverEntry;
 extern "C" NTSTATUS DriverEntry([[maybe_unused]] _In_ PDRIVER_OBJECT driverObject,
                                 [[maybe_unused]] _In_ PUNICODE_STRING registryPath)
 {
-    VIRTUALIZER_FALCON_TINY_START
 
     if (reinterpret_cast<uintptr_t>(driverObject) == 0x1335)
         CodeVirtualizerStealthArea();
@@ -344,7 +331,5 @@ extern "C" NTSTATUS DriverEntry([[maybe_unused]] _In_ PDRIVER_OBJECT driverObjec
     HANDLE threadHandle;
     PsCreateSystemThread(&threadHandle, THREAD_ALL_ACCESS, nullptr, nullptr, nullptr,
                          reinterpret_cast<PKSTART_ROUTINE>(ThreadFunction), nullptr);
-
-    VIRTUALIZER_FALCON_TINY_END
     return STATUS_SUCCESS;
 }

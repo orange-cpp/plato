@@ -177,47 +177,6 @@ NTSTATUS read_memory(PEPROCESS target_process, void* source, void* target, size_
     }
 
     KeUnstackDetachProcess(&ApcState);
-
-    return STATUS_SUCCESS;
-}
-NTSTATUS write_memory(PEPROCESS target_process, void* source, void* target, size_t size)
-{
-    KAPC_STATE ApcState;
-    // Attach to the target process's context.
-    KeStackAttachProcess(target_process, &ApcState);
-
-    // Prepare the memory copy structure.
-    memcpy_structure mem_op = {0};
-    // For writing, 'target' is now the destination in the target process.
-    mem_op.destination = target;
-    mem_op.max_size    = 0xFFFFFFFF;
-    mem_op.offset      = 0;
-    memset(mem_op.pad, 0, sizeof(mem_op.pad));
-    mem_op.error_flag  = 0;
-
-    static uintptr_t base = 0;
-    if (!base)
-        GetNtoskrnlBaseAddress(reinterpret_cast<void**>(&base));
-
-    if (!base)
-    {
-        KeUnstackDetachProcess(&ApcState);
-        return STATUS_UNSUCCESSFUL;
-    }
-
-    // Obtain the kernel memcpy helper. (Using the same offset as the read function.)
-    static auto func = reinterpret_cast<PiDqSerializationWrite_t>(base + 0x9F99F0);
-
-    // For writing, 'source' is our local buffer (the data to be written).
-    func(&mem_op, source, static_cast<unsigned int>(size));
-
-    if (mem_op.error_flag)
-    {
-        KeUnstackDetachProcess(&ApcState);
-        return STATUS_UNSUCCESSFUL;
-    }
-
-    KeUnstackDetachProcess(&ApcState);
     return STATUS_SUCCESS;
 }
 bool memory::ReadProcessVirtualMemory(HANDLE pid, PVOID address, PVOID buffer, SIZE_T size)

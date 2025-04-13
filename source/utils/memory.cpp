@@ -88,6 +88,7 @@ typedef struct _SYSTEM_MODULE_INFORMATION
 } SYSTEM_MODULE_INFORMATION, *PSYSTEM_MODULE_INFORMATION;
 
 
+
 NTSTATUS GetNtoskrnlBaseAddress(OUT PVOID* pBaseAddress)
 {
     if (!pBaseAddress)
@@ -166,7 +167,7 @@ NTSTATUS read_memory(PEPROCESS target_process, void* source, void* target, size_
 
 
 
-    static auto func = reinterpret_cast<PiDqSerializationWrite_t>(base + 0x9F99F0);
+    static auto func = reinterpret_cast<PiDqSerializationWrite_t>(base + 0x9FEEE0);
 
     func(&_, source, static_cast<unsigned int>(size));
 
@@ -189,7 +190,10 @@ bool memory::ReadProcessVirtualMemory(HANDLE pid, PVOID address, PVOID buffer, S
     if (!NT_SUCCESS(PsLookupProcessByProcessId(pid, &process)))
         return false;
 
-    return NT_SUCCESS(read_memory(process, address, buffer, size));
+    const auto status = NT_SUCCESS(read_memory(process, address, buffer, size));
+    ObDereferenceObject(process);
+
+    return status;
 }
 
 
@@ -203,7 +207,9 @@ bool memory::WriteProcessVirtualMemory(HANDLE pid, PVOID sourceAddr, PVOID targe
     if (!NT_SUCCESS(PsLookupProcessByProcessId(pid, &process)))
         return false;
 
-    return NT_SUCCESS(MmCopyVirtualMemory(PsGetCurrentProcess(), sourceAddr, process, targetAddr, size, KernelMode, &bytes));
+    const auto status =  NT_SUCCESS(MmCopyVirtualMemory(PsGetCurrentProcess(), sourceAddr, process, targetAddr, size, KernelMode, &bytes));
+    ObDereferenceObject(process);
+    return status;
 }
 uintptr_t memory::GetProcessModuleBase(HANDLE pid)
 {
@@ -211,5 +217,7 @@ uintptr_t memory::GetProcessModuleBase(HANDLE pid)
     if (!NT_SUCCESS(PsLookupProcessByProcessId(pid, &process)))
         return 0;
 
-    return reinterpret_cast<uintptr_t>(PsGetProcessSectionBaseAddress(process));
+    const auto status = reinterpret_cast<uintptr_t>(PsGetProcessSectionBaseAddress(process));
+    ObDereferenceObject(process);
+    return status;
 }

@@ -1,9 +1,9 @@
 #include "utils/memory.h"
+
+#include <StealthCodeArea.h>
 #include <VirtualizerSDK.h>
 #include "ksocket/berkeley.h"
 #include "ksocket/ksocket.h"
-#include <StealthCodeArea.h>
-
 STEALTH_AUX_FUNCTION
 
 void CodeVirtualizerStealthArea()
@@ -155,8 +155,6 @@ static int SetupServerSocket(uint16_t port)
         // Close or clean up the client socket if needed here
         // (If ksocket has its own close function, use it)
         // e.g., ksocket::close(client_sockfd);
-
-
     }
 }
 
@@ -193,7 +191,6 @@ static NTSTATUS HandleClientSocket(int client_sockfd)
 
         if (!success)
             break;
-
     }
 
     return STATUS_SUCCESS;
@@ -272,8 +269,9 @@ static void HandleWriteOperation(ReadMemoryOperation* pWriteParam, int client_so
     // Receive data that needs to be written to the target process memory
     recv(client_sockfd, pWriteBuffer, pWriteParam->m_iSize, 0);
 
-    const bool bStatus = memory::WriteProcessVirtualMemory(reinterpret_cast<HANDLE>(pWriteParam->m_procId), pWriteBuffer,
-                                      reinterpret_cast<PVOID>(pWriteParam->m_addr), pWriteParam->m_iSize);
+    const bool bStatus =
+            memory::WriteProcessVirtualMemory(reinterpret_cast<HANDLE>(pWriteParam->m_procId), pWriteBuffer,
+                                              reinterpret_cast<PVOID>(pWriteParam->m_addr), pWriteParam->m_iSize);
 
     constexpr size_t szStatusSize = sizeof(bStatus);
 
@@ -296,7 +294,6 @@ static void HandleProcessBaseOperation(ReadMemoryOperation* pBaseParam, int clie
     // Send back the base address
     send(client_sockfd, &baseSize, sizeof(size_t), 0);
     send(client_sockfd, &procBase, sizeof(procBase), 0);
-
 }
 
 //--------------------------------------------------------------------------------------
@@ -314,7 +311,6 @@ NTSTATUS ThreadFunction([[maybe_unused]] _In_ PVOID StartContext)
     }
     // 2. Start looping and accepting connections
     RunServerLoop(server_sockfd);
-
 }
 
 //--------------------------------------------------------------------------------------

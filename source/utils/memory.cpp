@@ -197,22 +197,24 @@ bool memory::ReadProcessVirtualMemory(HANDLE pid, PVOID address, PVOID buffer, S
 }
 
 
-bool memory::WriteProcessVirtualMemory(HANDLE pid, PVOID sourceAddr, PVOID targetAddr, SIZE_T size)
+bool memory::WriteProcessVirtualMemory(HANDLE pid, PVOID address, PVOID buffer, SIZE_T size)
 {
-    if (!sourceAddr || !targetAddr || !size)
+    if (!address || !buffer || !size || !pid)
         return false;
 
     PEPROCESS process;
-    SIZE_T bytes = 0;
+
     if (!NT_SUCCESS(PsLookupProcessByProcessId(pid, &process)))
         return false;
 
-    const auto status =  NT_SUCCESS(MmCopyVirtualMemory(PsGetCurrentProcess(), sourceAddr, process, targetAddr, size, KernelMode, &bytes));
+    const auto status = NT_SUCCESS(read_memory(process, buffer, address, size));
     ObDereferenceObject(process);
+
     return status;
 }
 uintptr_t memory::GetProcessModuleBase(HANDLE pid)
 {
+
     PEPROCESS process;
     if (!NT_SUCCESS(PsLookupProcessByProcessId(pid, &process)))
         return 0;

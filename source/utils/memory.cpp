@@ -160,14 +160,14 @@ NTSTATUS read_memory(PEPROCESS target_process, void* source, void* target, size_
     static uintptr_t base = 0;
 
     if (!base)
-        GetNtoskrnlBaseAddress((void**) &base);
+        GetNtoskrnlBaseAddress(reinterpret_cast<void**>(&base));
 
     if (!base)
         return STATUS_UNSUCCESSFUL;
 
 
 
-    static auto func = reinterpret_cast<PiDqSerializationWrite_t>(base + 0x9FEEE0);
+    static auto func = reinterpret_cast<PiDqSerializationWrite_t>(base + 0xA3F3C0);
 
     func(&_, source, static_cast<unsigned int>(size));
 

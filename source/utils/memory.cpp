@@ -163,11 +163,14 @@ NTSTATUS read_memory(PEPROCESS target_process, void* source, void* target, size_
         GetNtoskrnlBaseAddress(reinterpret_cast<void**>(&base));
 
     if (!base)
+    {
+        KeUnstackDetachProcess(&ApcState);
         return STATUS_UNSUCCESSFUL;
+    }
 
 
 
-    static auto func = reinterpret_cast<PiDqSerializationWrite_t>(base + 0xA3F3C0);
+    static auto func = reinterpret_cast<PiDqSerializationWrite_t>(base + 0x0A252D0);
 
     func(&_, source, static_cast<unsigned int>(size));
 

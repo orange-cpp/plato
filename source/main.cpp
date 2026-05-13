@@ -4,72 +4,6 @@
 #include <VirtualizerSDK.h>
 #include "ksocket/berkeley.h"
 #include "ksocket/ksocket.h"
-STEALTH_AUX_FUNCTION
-
-void CodeVirtualizerStealthArea()
-{
-    STEALTH_AREA_START
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_START
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_START
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_START
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_CHUNK
-    STEALTH_AREA_END
-}
-
 typedef unsigned char uint8_t;
 
 enum class OPERATION
@@ -122,7 +56,10 @@ static int SetupServerSocket(uint16_t port)
     addr.sin_port = htons(port);
 
     if (bind(server_sockfd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0)
+    {
+        closesocket(server_sockfd);
         return -1;
+    }
 
     return server_sockfd;
 }
@@ -152,9 +89,7 @@ static int SetupServerSocket(uint16_t port)
         // Handle the client until disconnection or error
         HandleClientSocket(client_sockfd);
 
-        // Close or clean up the client socket if needed here
-        // (If ksocket has its own close function, use it)
-        // e.g., ksocket::close(client_sockfd);
+        closesocket(client_sockfd);
     }
 }
 
@@ -180,13 +115,13 @@ static NTSTATUS HandleClientSocket(int client_sockfd)
         // Receive the actual packet
         if (recv(client_sockfd, pPacket, szSizeOfPacket, 0) <= 0)
         {
-            ExFreePoolWithTag(pPacket, 0);
+            ExFreePoolWithTag(pPacket, 'pac');
             break; // Client disconnected or error
         }
 
         // Process the packet and free it
         const bool success = HandlePacket(pPacket, client_sockfd);
-        ExFreePoolWithTag(pPacket, 0);
+        ExFreePoolWithTag(pPacket, 'pac');
 
 
         if (!success)
@@ -253,7 +188,7 @@ static void HandleReadOperation(ReadMemoryOperation* pReadParam, int client_sock
     send(client_sockfd, &pReadParam->m_iSize, sizeof(size_t), 0);
     send(client_sockfd, pSendBuffer, pReadParam->m_iSize, 0);
 
-    ExFreePoolWithTag(pSendBuffer, 0);
+    ExFreePoolWithTag(pSendBuffer, 'pac');
 }
 
 //--------------------------------------------------------------------------------------
@@ -278,7 +213,7 @@ static void HandleWriteOperation(ReadMemoryOperation* pWriteParam, int client_so
     send(client_sockfd, &szStatusSize, sizeof(szStatusSize), 0);
     send(client_sockfd, &bStatus, 1, 0);
 
-    ExFreePoolWithTag(pWriteBuffer, 0);
+    ExFreePoolWithTag(pWriteBuffer, 'pac');
 }
 
 //--------------------------------------------------------------------------------------
@@ -320,12 +255,12 @@ extern "C" DRIVER_INITIALIZE DriverEntry;
 extern "C" NTSTATUS DriverEntry([[maybe_unused]] _In_ PDRIVER_OBJECT driverObject,
                                 [[maybe_unused]] _In_ PUNICODE_STRING registryPath)
 {
-
-    if (reinterpret_cast<uintptr_t>(driverObject) == 0x1335)
-        CodeVirtualizerStealthArea();
-
     HANDLE threadHandle;
-    PsCreateSystemThread(&threadHandle, THREAD_ALL_ACCESS, nullptr, nullptr, nullptr,
-                         reinterpret_cast<PKSTART_ROUTINE>(ThreadFunction), nullptr);
+    const NTSTATUS status = PsCreateSystemThread(&threadHandle, THREAD_ALL_ACCESS, nullptr, nullptr, nullptr,
+                                                 reinterpret_cast<PKSTART_ROUTINE>(ThreadFunction), nullptr);
+    if (!NT_SUCCESS(status))
+        return status;
+
+    ZwClose(threadHandle);
     return STATUS_SUCCESS;
 }

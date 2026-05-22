@@ -1,4 +1,5 @@
 #include "utils/memory.h"
+#include "utils/mouse.h"
 
 #include <StealthCodeArea.h>
 #include <VirtualizerSDK.h>
@@ -11,6 +12,7 @@ enum class OPERATION
     READ,
     WRITE,
     PROCESS_BASE,
+    MOVE_MOUSE_RELATIVE,
 };
 
 class BasePacket
@@ -27,6 +29,13 @@ public:
     size_t m_iSize;
 };
 
+class MouseMoveRelativeOperation final : public BasePacket
+{
+public:
+    LONG m_x;
+    LONG m_y;
+};
+
 
 
 //--------------------------------------------------------------------------------------
@@ -37,6 +46,7 @@ static bool HandlePacket(BasePacket* pPacket, int client_sockfd);
 static void HandleReadOperation(ReadMemoryOperation* pReadParam, int client_sockfd);
 static void HandleWriteOperation(ReadMemoryOperation* pWriteParam, int client_sockfd);
 static void HandleProcessBaseOperation(ReadMemoryOperation* pBaseParam, int client_sockfd);
+static void HandleMouseMoveRelativeOperation(MouseMoveRelativeOperation* pMoveParam, int client_sockfd);
 
 //--------------------------------------------------------------------------------------
 // Sets up the server socket and returns the listening socket file descriptor,
@@ -158,6 +168,12 @@ static bool HandlePacket(BasePacket* pPacket, int client_sockfd)
             HandleProcessBaseOperation(pBaseParam, client_sockfd);
             return true;
         }
+        case OPERATION::MOVE_MOUSE_RELATIVE:
+        {
+            auto pMoveParam = static_cast<MouseMoveRelativeOperation*>(pPacket);
+            HandleMouseMoveRelativeOperation(pMoveParam, client_sockfd);
+            return true;
+        }
     }
     // Unknown operation: send failure response
     constexpr bool bStatus = false;
@@ -229,6 +245,19 @@ static void HandleProcessBaseOperation(ReadMemoryOperation* pBaseParam, int clie
     // Send back the base address
     send(client_sockfd, &baseSize, sizeof(size_t), 0);
     send(client_sockfd, &procBase, sizeof(procBase), 0);
+}
+
+//--------------------------------------------------------------------------------------
+// MOUSE_MOVE_RELATIVE operation handling
+//--------------------------------------------------------------------------------------
+static void HandleMouseMoveRelativeOperation(MouseMoveRelativeOperation* pMoveParam, int client_sockfd)
+{
+    const bool bStatus = mouse::MoveRelative(pMoveParam->m_x, pMoveParam->m_y);
+
+    constexpr size_t szStatusSize = sizeof(bStatus);
+
+    send(client_sockfd, &szStatusSize, sizeof(szStatusSize), 0);
+    send(client_sockfd, &bStatus, 1, 0);
 }
 
 //--------------------------------------------------------------------------------------

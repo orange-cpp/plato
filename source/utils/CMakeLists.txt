@@ -1,1 +1,1 @@
-target_sources(plato PRIVATE memory.cpp)
+target_sources(plato PRIVATE memory.cpp mouse.cpp)

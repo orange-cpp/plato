@@ -1,10 +1,8 @@
-#include "utils/memory.h"
-#include "utils/mouse.h"
+#include "plato/utils/memory.hpp"
+#include "plato/utils/mouse.hpp"
 
-#include <StealthCodeArea.h>
-#include <VirtualizerSDK.h>
-#include "ksocket/berkeley.h"
-#include "ksocket/ksocket.h"
+#include <ksocket/berkeley.h>
+#include <ksocket/ksocket.h>
 typedef unsigned char uint8_t;
 
 enum class OPERATION
@@ -151,26 +149,26 @@ static bool HandlePacket(BasePacket* pPacket, int client_sockfd)
     {
         case OPERATION::READ:
         {
-            auto pReadParam = static_cast<ReadMemoryOperation*>(pPacket);
+            auto pReadParam = reinterpret_cast<ReadMemoryOperation*>(pPacket);
             HandleReadOperation(pReadParam, client_sockfd);
 
             return true;
         }
         case OPERATION::WRITE:
         {
-            auto pWriteParam = static_cast<ReadMemoryOperation*>(pPacket);
+            auto pWriteParam = reinterpret_cast<ReadMemoryOperation*>(pPacket);
             HandleWriteOperation(pWriteParam, client_sockfd);
             return true;
         }
         case OPERATION::PROCESS_BASE:
         {
-            auto pBaseParam = static_cast<ReadMemoryOperation*>(pPacket);
+            auto pBaseParam = reinterpret_cast<ReadMemoryOperation*>(pPacket);
             HandleProcessBaseOperation(pBaseParam, client_sockfd);
             return true;
         }
         case OPERATION::MOVE_MOUSE_RELATIVE:
         {
-            auto pMoveParam = static_cast<MouseMoveRelativeOperation*>(pPacket);
+            auto pMoveParam = reinterpret_cast<MouseMoveRelativeOperation*>(pPacket);
             HandleMouseMoveRelativeOperation(pMoveParam, client_sockfd);
             return true;
         }

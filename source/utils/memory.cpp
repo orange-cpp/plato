@@ -1,5 +1,4 @@
-#include "memory.h"
-#include <VirtualizerSDK.h>
+#include "plato/utils/memory.hpp"
 #include <climits>
 #include <cstdint>
 #include <ntddk.h>
@@ -195,9 +194,9 @@ NTSTATUS GetNtoskrnlBaseAddress(OUT PVOID* pBaseAddress)
     //
     // Allocate enough space for the module information.
     //
-    pModuleInfo = (PSYSTEM_MODULE_INFORMATION) ExAllocatePoolWithTag(NonPagedPool, bufferSize,
-                                                                     'ldoM' // A simple pool tag, e.g. "M0dl"
-    );
+    pModuleInfo = static_cast<PSYSTEM_MODULE_INFORMATION>(ExAllocatePoolWithTag(NonPagedPool, bufferSize,
+                                                                                'ldoM' // A simple pool tag, e.g. "M0dl"
+                                                                                ));
     if (!pModuleInfo)
         return STATUS_INSUFFICIENT_RESOURCES;
 

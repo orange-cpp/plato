@@ -1,0 +1,3 @@
+[submodule "extlibs/ksocket"]
+	path = extlibs/ksocket
+	url = https://github.com/wbenny/ksocket

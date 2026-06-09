@@ -1,17 +1,21 @@
 cmake_minimum_required(VERSION 3.30)
-
-
 project(plato)
 
 
-set(CMAKE_CXX_STANDARD 23)
+file(GLOB_RECURSE PLATO_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/source/*.cpp")
+file(GLOB_RECURSE PLATO_HEADERS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/include/*.hpp")
+
+
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake")
+
 find_package(WDK REQUIRED)
 
-wdk_add_driver(plato KMDF 1.15 source/main.cpp)
+wdk_add_driver(${PROJECT_NAME} KMDF 1.15 ${PLATO_SOURCES} ${PLATO_HEADERS})
+set_target_properties(${PROJECT_NAME} PROPERTIES CXX_STANDARD 23)
 
-
+add_subdirectory(extlibs)
 add_subdirectory(source)
-add_subdirectory(extlibs/code_virtualizer)
 
-target_link_libraries(plato WDK::NETIO cv-sdk)
+
+target_link_libraries(${PROJECT_NAME} WDK::NETIO ksocket)
+target_include_directories(${PROJECT_NAME} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")

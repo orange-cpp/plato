@@ -1,4 +1,4 @@
-#include "mouse.h"
+#include "plato/utils/mouse.hpp"
 
 #include <cstdint>
 

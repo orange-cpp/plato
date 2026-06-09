@@ -5,6 +5,7 @@
 #include <ntddk.h>
 #include <ntdef.h>
 #include <ntifs.h>
+#include <ntimage.h>
 #include <windef.h>
 
 typedef enum _SYSTEM_INFORMATION_CLASS
@@ -65,6 +66,87 @@ struct memcpy_structure
 };
 
 typedef unsigned __int64(__fastcall* PiDqSerializationWrite_t)(memcpy_structure* a1, void* a2, unsigned int a3);
+
+namespace
+{
+    constexpr char kPiDqSerializationWritePattern[] =
+            "\x48\x89\x5C\x24?\x48\x89\x4C\x24?\x57\x48\x83\xEC?\x41\x8B\xF8";
+
+    constexpr char kPiDqSerializationWriteMask[] = "xxxx?xxxx?xxxx?xxx";
+    constexpr auto kPiDqSerializationWritePatternSize = sizeof(kPiDqSerializationWriteMask) - 1;
+
+    static_assert(sizeof(kPiDqSerializationWritePattern) == sizeof(kPiDqSerializationWriteMask));
+
+    bool IsPageSection(const IMAGE_SECTION_HEADER* section)
+    {
+        constexpr unsigned char pageSectionName[] = {'P', 'A', 'G', 'E'};
+        return RtlCompareMemory(section->Name, pageSectionName, sizeof(pageSectionName)) == sizeof(pageSectionName) &&
+               section->Name[sizeof(pageSectionName)] == '\0';
+    }
+
+    uintptr_t FindPattern(const unsigned char* start, size_t size, const char* pattern, const char* mask,
+                          size_t patternSize)
+    {
+        if (size < patternSize)
+            return 0;
+
+        for (size_t i = 0; i <= size - patternSize; ++i)
+        {
+            bool found = true;
+
+            for (size_t j = 0; j < patternSize; ++j)
+            {
+                if (mask[j] == 'x' && start[i + j] != static_cast<unsigned char>(pattern[j]))
+                {
+                    found = false;
+                    break;
+                }
+            }
+
+            if (found)
+                return reinterpret_cast<uintptr_t>(start + i);
+        }
+
+        return 0;
+    }
+
+    PiDqSerializationWrite_t FindPiDqSerializationWrite(uintptr_t ntoskrnlBase)
+    {
+        const auto dosHeader = reinterpret_cast<PIMAGE_DOS_HEADER>(ntoskrnlBase);
+        if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE)
+            return nullptr;
+
+        const auto ntHeaders = reinterpret_cast<PIMAGE_NT_HEADERS64>(ntoskrnlBase + dosHeader->e_lfanew);
+        if (ntHeaders->Signature != IMAGE_NT_SIGNATURE)
+            return nullptr;
+
+        const auto imageSize = ntHeaders->OptionalHeader.SizeOfImage;
+        const auto sections = IMAGE_FIRST_SECTION(ntHeaders);
+
+        for (WORD i = 0; i < ntHeaders->FileHeader.NumberOfSections; ++i)
+        {
+            const auto section = &sections[i];
+            if (!IsPageSection(section) || section->VirtualAddress >= imageSize)
+                continue;
+
+            auto sectionSize = section->Misc.VirtualSize;
+            if (!sectionSize)
+                sectionSize = section->SizeOfRawData;
+
+            if (sectionSize > imageSize - section->VirtualAddress)
+                sectionSize = imageSize - section->VirtualAddress;
+
+            const auto address =
+                    FindPattern(reinterpret_cast<unsigned char*>(ntoskrnlBase + section->VirtualAddress), sectionSize,
+                                kPiDqSerializationWritePattern, kPiDqSerializationWriteMask,
+                                kPiDqSerializationWritePatternSize);
+            if (address)
+                return reinterpret_cast<PiDqSerializationWrite_t>(address);
+        }
+
+        return nullptr;
+    }
+}
 
 
 typedef struct _SYSTEM_MODULE_ENTRY
@@ -170,7 +252,13 @@ NTSTATUS read_memory(PEPROCESS target_process, void* source, void* target, size_
 
 
 
-    static auto func = reinterpret_cast<PiDqSerializationWrite_t>(base + 0x0A252D0);
+    static PiDqSerializationWrite_t func = FindPiDqSerializationWrite(base);
+
+    if (!func)
+    {
+        KeUnstackDetachProcess(&ApcState);
+        return STATUS_UNSUCCESSFUL;
+    }
 
     func(&_, source, static_cast<unsigned int>(size));
 

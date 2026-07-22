@@ -41,7 +41,7 @@ public:
 //--------------------------------------------------------------------------------------
 static NTSTATUS HandleClientSocket(int client_sockfd);
 static bool HandlePacket(BasePacket* pPacket, int client_sockfd);
-static void HandleReadOperation(ReadMemoryOperation* pReadParam, int client_sockfd);
+static void HandleReadOperation(const ReadMemoryOperation* pReadParam, int client_sockfd);
 static void HandleWriteOperation(ReadMemoryOperation* pWriteParam, int client_sockfd);
 static void HandleProcessBaseOperation(ReadMemoryOperation* pBaseParam, int client_sockfd);
 static void HandleMouseMoveRelativeOperation(MouseMoveRelativeOperation* pMoveParam, int client_sockfd);
@@ -185,7 +185,7 @@ static bool HandlePacket(BasePacket* pPacket, int client_sockfd)
 //--------------------------------------------------------------------------------------
 // READ operation handling
 //--------------------------------------------------------------------------------------
-static void HandleReadOperation(ReadMemoryOperation* pReadParam, int client_sockfd)
+static void HandleReadOperation(const ReadMemoryOperation* pReadParam, int client_sockfd)
 {
     // Allocate buffer to hold the data we’ll read
     auto pSendBuffer = ExAllocatePoolWithTag(NonPagedPool, pReadParam->m_iSize, 'pac');
@@ -264,7 +264,7 @@ static void HandleMouseMoveRelativeOperation(MouseMoveRelativeOperation* pMovePa
 [[noreturn]]
 NTSTATUS ThreadFunction([[maybe_unused]] _In_ PVOID StartContext)
 {
-    int server_sockfd = SetupServerSocket(7653);
+    const int server_sockfd = SetupServerSocket(7653);
     if (server_sockfd < 0)
     {
         // Failed to set up server socket – do error handling as needed

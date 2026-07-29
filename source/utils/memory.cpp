@@ -1,315 +1,242 @@
 #include "plato/utils/memory.hpp"
-#include <climits>
-#include <cstdint>
-#include <ntddk.h>
-#include <ntdef.h>
-#include <ntifs.h>
-#include <ntimage.h>
-#include <windef.h>
 
-typedef enum _SYSTEM_INFORMATION_CLASS
-{
-    SystemBasicInformation,
-    SystemProcessorInformation,
-    SystemPerformanceInformation,
-    SystemTimeOfDayInformation,
-    SystemPathInformation,
-    SystemProcessInformation,
-    SystemCallCountInformation,
-    SystemDeviceInformation,
-    SystemProcessorPerformanceInformation,
-    SystemFlagsInformation,
-    SystemCallTimeInformation,
-    SystemModuleInformation = 0x0B
-} SYSTEM_INFORMATION_CLASS,
-        *PSYSTEM_INFORMATION_CLASS;
+#include <intrin.h>
 
-typedef struct _RTL_PROCESS_MODULE_INFORMATION
-{
-    HANDLE Section;
-    PVOID MappedBase;
-    PVOID ImageBase;
-    ULONG ImageSize;
-    ULONG Flags;
-    USHORT LoadOrderIndex;
-    USHORT InitOrderIndex;
-    USHORT LoadCount;
-    USHORT OffsetToFileName;
-    UCHAR FullPathName[256];
-} RTL_PROCESS_MODULE_INFORMATION, *PRTL_PROCESS_MODULE_INFORMATION;
-
-typedef struct _RTL_PROCESS_MODULES
-{
-    ULONG NumberOfModules;
-    RTL_PROCESS_MODULE_INFORMATION Modules[1];
-} RTL_PROCESS_MODULES, *PRTL_PROCESS_MODULES;
-
-
-extern "C" NTSTATUS ZwQuerySystemInformation(ULONG InfoClass, PVOID Buffer, ULONG Length, PULONG ReturnLength);
-extern "C" NTKERNELAPI PVOID NTAPI RtlFindExportedRoutineByName(_In_ PVOID ImageBase, _In_ PCCH RoutineName);
-extern "C" NTKERNELAPI PVOID PsGetProcessSectionBaseAddress(__in PEPROCESS Process);
-
-extern "C"   NTKERNELAPI  NTSTATUS ZwProtectVirtualMemory (
-        IN HANDLE ProcessHandle,
-        IN OUT PVOID* BaseAddress,
-        IN OUT SIZE_T* NumberOfBytesToProtect,
-        IN ULONG NewAccessProtection,
-        OUT PULONG OldAccessProtection );
-struct memcpy_structure
-{
-    void* destination;
-    unsigned int max_size;
-    unsigned int offset;
-    unsigned char pad[0xF];
-    unsigned char error_flag;
-};
-
-typedef unsigned __int64(__fastcall* PiDqSerializationWrite_t)(memcpy_structure* a1, void* a2, unsigned int a3);
+extern "C" NTKERNELAPI PVOID NTAPI PsGetProcessSectionBaseAddress(_In_ PEPROCESS Process);
 
 namespace
 {
-    constexpr char kPiDqSerializationWritePattern[] =
-            "\x48\x89\x5C\x24?\x48\x89\x4C\x24?\x57\x48\x83\xEC?\x41\x8B\xF8";
+    constexpr uint64_t kPageSize = 0x1000;
+    constexpr uint64_t kPageMask = kPageSize - 1;
+    constexpr uint64_t kPageTableIndexMask = 0x1FF;
+    constexpr uint64_t kPagePresent = 1;
+    constexpr uint64_t kLargePage = 1ULL << 7;
 
-    constexpr char kPiDqSerializationWriteMask[] = "xxxx?xxxx?xxxx?xxx";
-    constexpr auto kPiDqSerializationWritePatternSize = sizeof(kPiDqSerializationWriteMask) - 1;
+    // Four-level x64 paging reserves bits 12-51 of a page-table entry for the physical frame number.
+    constexpr uint64_t kPhysicalPageMask = 0x000F'FFFF'FFFF'F000ULL;
+    constexpr uint64_t kTwoMegabytePageMask = kPhysicalPageMask & ~((1ULL << 21) - 1);
+    constexpr uint64_t kOneGigabytePageMask = kPhysicalPageMask & ~((1ULL << 30) - 1);
 
-    static_assert(sizeof(kPiDqSerializationWritePattern) == sizeof(kPiDqSerializationWriteMask));
-
-    bool IsPageSection(const IMAGE_SECTION_HEADER* section)
+    class LockedUserRange final
     {
-        constexpr unsigned char pageSectionName[] = {'P', 'A', 'G', 'E'};
-        return RtlCompareMemory(section->Name, pageSectionName, sizeof(pageSectionName)) == sizeof(pageSectionName) &&
-               section->Name[sizeof(pageSectionName)] == '\0';
-    }
+    public:
+        LockedUserRange() = default;
 
-    uintptr_t FindPattern(const unsigned char* start, size_t size, const char* pattern, const char* mask,
-                          size_t patternSize)
-    {
-        if (size < patternSize)
-            return 0;
-
-        for (size_t i = 0; i <= size - patternSize; ++i)
+        ~LockedUserRange()
         {
-            bool found = true;
+            Reset();
+        }
 
-            for (size_t j = 0; j < patternSize; ++j)
+        LockedUserRange(const LockedUserRange&) = delete;
+        LockedUserRange& operator=(const LockedUserRange&) = delete;
+
+        NTSTATUS Lock(PEPROCESS process, PVOID address, SIZE_T size, LOCK_OPERATION operation, uint64_t* cr3)
+        {
+            if (!process || !address || !size || size > memory::kMaxTransferSize || !cr3)
+                return STATUS_INVALID_PARAMETER;
+
+            m_mdl = IoAllocateMdl(address, static_cast<ULONG>(size), FALSE, FALSE, nullptr);
+            if (!m_mdl)
+                return STATUS_INSUFFICIENT_RESOURCES;
+
+            KAPC_STATE apcState{};
+            NTSTATUS status = STATUS_SUCCESS;
+
+            KeStackAttachProcess(process, &apcState);
+            __try
             {
-                if (mask[j] == 'x' && start[i + j] != static_cast<unsigned char>(pattern[j]))
-                {
-                    found = false;
-                    break;
-                }
+                // The target buffer is a user-mode address in the attached process. Locking it prevents its
+                // physical frames from being released or remapped while the CR3 walk and physical copy run.
+                MmProbeAndLockPages(m_mdl, UserMode, operation);
+                m_locked = true;
+
+                *cr3 = __readcr3() & kPhysicalPageMask;
+                if (!*cr3)
+                    status = STATUS_UNSUCCESSFUL;
+            } __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                status = GetExceptionCode();
+            }
+            KeUnstackDetachProcess(&apcState);
+
+            if (!NT_SUCCESS(status))
+                Reset();
+
+            return status;
+        }
+
+    private:
+        void Reset()
+        {
+            if (m_locked)
+            {
+                MmUnlockPages(m_mdl);
+                m_locked = false;
             }
 
-            if (found)
-                return reinterpret_cast<uintptr_t>(start + i);
+            if (m_mdl)
+            {
+                IoFreeMdl(m_mdl);
+                m_mdl = nullptr;
+            }
         }
 
-        return 0;
+        PMDL m_mdl{};
+        bool m_locked{};
+    };
+
+    bool IsCanonicalAddress(uint64_t address)
+    {
+        const uint64_t upperBits = address >> 48;
+        return upperBits == 0 || upperBits == 0xFFFF;
     }
 
-    PiDqSerializationWrite_t FindPiDqSerializationWrite(uintptr_t ntoskrnlBase)
+    bool ReadPhysicalMemory(uint64_t physicalAddress, void* buffer, SIZE_T size)
     {
-        const auto dosHeader = reinterpret_cast<PIMAGE_DOS_HEADER>(ntoskrnlBase);
-        if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE)
-            return nullptr;
+        MM_COPY_ADDRESS source{};
+        source.PhysicalAddress.QuadPart = static_cast<LONGLONG>(physicalAddress);
 
-        const auto ntHeaders = reinterpret_cast<PIMAGE_NT_HEADERS64>(ntoskrnlBase + dosHeader->e_lfanew);
-        if (ntHeaders->Signature != IMAGE_NT_SIGNATURE)
-            return nullptr;
+        SIZE_T bytesCopied = 0;
+        const NTSTATUS status = MmCopyMemory(buffer, source, size, MM_COPY_MEMORY_PHYSICAL, &bytesCopied);
+        return NT_SUCCESS(status) && bytesCopied == size;
+    }
 
-        const auto imageSize = ntHeaders->OptionalHeader.SizeOfImage;
-        const auto sections = IMAGE_FIRST_SECTION(ntHeaders);
+    bool ReadPageTableEntry(uint64_t tablePhysicalAddress, uint64_t index, uint64_t* entry)
+    {
+        return ReadPhysicalMemory(tablePhysicalAddress + index * sizeof(*entry), entry, sizeof(*entry));
+    }
 
-        for (WORD i = 0; i < ntHeaders->FileHeader.NumberOfSections; ++i)
+    bool TranslateVirtualAddress(uint64_t cr3, uint64_t virtualAddress, uint64_t* physicalAddress)
+    {
+        if (!IsCanonicalAddress(virtualAddress) || !physicalAddress)
+            return false;
+
+        const uint64_t pml4Index = (virtualAddress >> 39) & kPageTableIndexMask;
+        const uint64_t pdptIndex = (virtualAddress >> 30) & kPageTableIndexMask;
+        const uint64_t pdIndex = (virtualAddress >> 21) & kPageTableIndexMask;
+        const uint64_t ptIndex = (virtualAddress >> 12) & kPageTableIndexMask;
+
+        uint64_t pml4e = 0;
+        if (!ReadPageTableEntry(cr3, pml4Index, &pml4e) || !(pml4e & kPagePresent))
+            return false;
+
+        uint64_t pdpte = 0;
+        if (!ReadPageTableEntry(pml4e & kPhysicalPageMask, pdptIndex, &pdpte) || !(pdpte & kPagePresent))
+            return false;
+
+        if (pdpte & kLargePage)
         {
-            const auto section = &sections[i];
-            if (!IsPageSection(section) || section->VirtualAddress >= imageSize)
-                continue;
-
-            auto sectionSize = section->Misc.VirtualSize;
-            if (!sectionSize)
-                sectionSize = section->SizeOfRawData;
-
-            if (sectionSize > imageSize - section->VirtualAddress)
-                sectionSize = imageSize - section->VirtualAddress;
-
-            const auto address =
-                    FindPattern(reinterpret_cast<unsigned char*>(ntoskrnlBase + section->VirtualAddress), sectionSize,
-                                kPiDqSerializationWritePattern, kPiDqSerializationWriteMask,
-                                kPiDqSerializationWritePatternSize);
-            if (address)
-                return reinterpret_cast<PiDqSerializationWrite_t>(address);
+            *physicalAddress = (pdpte & kOneGigabytePageMask) | (virtualAddress & ((1ULL << 30) - 1));
+            return true;
         }
 
-        return nullptr;
+        uint64_t pde = 0;
+        if (!ReadPageTableEntry(pdpte & kPhysicalPageMask, pdIndex, &pde) || !(pde & kPagePresent))
+            return false;
+
+        if (pde & kLargePage)
+        {
+            *physicalAddress = (pde & kTwoMegabytePageMask) | (virtualAddress & ((1ULL << 21) - 1));
+            return true;
+        }
+
+        uint64_t pte = 0;
+        if (!ReadPageTableEntry(pde & kPhysicalPageMask, ptIndex, &pte) || !(pte & kPagePresent))
+            return false;
+
+        *physicalAddress = (pte & kPhysicalPageMask) | (virtualAddress & kPageMask);
+        return true;
     }
-}
 
-
-typedef struct _SYSTEM_MODULE_ENTRY
-{
-    HANDLE Section;
-    PVOID MappedBase;
-    PVOID ImageBase;
-    ULONG ImageSize;
-    ULONG Flags;
-    USHORT LoadOrderIndex;
-    USHORT InitOrderIndex;
-    USHORT LoadCount;
-    USHORT ModuleNameOffset;
-    CHAR ImageName[256];
-} SYSTEM_MODULE_ENTRY, *PSYSTEM_MODULE_ENTRY;
-
-typedef struct _SYSTEM_MODULE_INFORMATION
-{
-    ULONG Count;
-    SYSTEM_MODULE_ENTRY Module[1];
-} SYSTEM_MODULE_INFORMATION, *PSYSTEM_MODULE_INFORMATION;
-
-
-
-NTSTATUS GetNtoskrnlBaseAddress(OUT PVOID* pBaseAddress)
-{
-    if (!pBaseAddress)
+    bool WritePhysicalMemory(uint64_t physicalAddress, const void* buffer, SIZE_T size)
     {
-        return STATUS_INVALID_PARAMETER;
+        const uint64_t physicalPage = physicalAddress & ~kPageMask;
+        const SIZE_T pageOffset = static_cast<SIZE_T>(physicalAddress & kPageMask);
+        const SIZE_T mapSize = pageOffset + size;
+
+        PHYSICAL_ADDRESS pageAddress{};
+        pageAddress.QuadPart = static_cast<LONGLONG>(physicalPage);
+
+        PVOID mappedPage = MmMapIoSpace(pageAddress, mapSize, MmCached);
+        if (!mappedPage)
+            return false;
+
+        RtlCopyMemory(static_cast<unsigned char*>(mappedPage) + pageOffset, buffer, size);
+        MmUnmapIoSpace(mappedPage, mapSize);
+        return true;
     }
 
-    *pBaseAddress = nullptr;
-
-    ULONG bufferSize = 0;
-    PSYSTEM_MODULE_INFORMATION pModuleInfo = nullptr;
-
-    //
-    // First call ZwQuerySystemInformation with a NULL buffer to get size needed.
-    //
-    NTSTATUS status = ZwQuerySystemInformation(SystemModuleInformation, nullptr, 0, &bufferSize);
-
-    if (status != STATUS_INFO_LENGTH_MISMATCH)
-        return status; // Some error other than "needs more space"
-
-
-    //
-    // Allocate enough space for the module information.
-    //
-    pModuleInfo = static_cast<PSYSTEM_MODULE_INFORMATION>(ExAllocatePoolWithTag(NonPagedPool, bufferSize,
-                                                                                'ldoM' // A simple pool tag, e.g. "M0dl"
-                                                                                ));
-    if (!pModuleInfo)
-        return STATUS_INSUFFICIENT_RESOURCES;
-
-
-    //
-    // Query again with the allocated buffer.
-    //
-    status = ZwQuerySystemInformation(SystemModuleInformation, pModuleInfo, bufferSize, &bufferSize);
-    if (!NT_SUCCESS(status))
+    bool CopyTranslatedPhysicalMemory(uint64_t cr3, uint64_t virtualAddress, void* buffer, SIZE_T size, bool write)
     {
-        ExFreePool(pModuleInfo);
-        return status;
+        auto* bytes = static_cast<unsigned char*>(buffer);
+
+        while (size)
+        {
+            uint64_t physicalAddress = 0;
+            if (!TranslateVirtualAddress(cr3, virtualAddress, &physicalAddress))
+                return false;
+
+            const SIZE_T bytesToPageBoundary = static_cast<SIZE_T>(kPageSize - (physicalAddress & kPageMask));
+            const SIZE_T chunkSize = size < bytesToPageBoundary ? size : bytesToPageBoundary;
+            const bool copied = write ? WritePhysicalMemory(physicalAddress, bytes, chunkSize)
+                                      : ReadPhysicalMemory(physicalAddress, bytes, chunkSize);
+            if (!copied)
+                return false;
+
+            bytes += chunkSize;
+            virtualAddress += chunkSize;
+            size -= chunkSize;
+        }
+
+        return true;
     }
+} // namespace
 
-    //
-    // The first entry in the returned module list is typically ntoskrnl.exe.
-    // Because "Module[0]" is almost always the kernel, we set that as the result.
-    // Alternatively, you could iterate and look for "ntoskrnl.exe" in ImageName.
-    //
-    if (pModuleInfo->Count > 0)
-        *pBaseAddress = pModuleInfo->Module[0].ImageBase;
-
-    //
-    // Cleanup
-    //
-    ExFreePool(pModuleInfo);
-    return STATUS_SUCCESS;
-}
-
-NTSTATUS read_memory(PEPROCESS target_process, void* source, void* target, size_t size)
-{
-    KAPC_STATE ApcState;
-    KeStackAttachProcess(target_process, &ApcState);
-
-    memcpy_structure _{};
-    _.destination = target;
-    _.max_size = 0xFFFFFFFF;
-    _.offset = 0;
-    memset(_.pad, 0, sizeof(_.pad));
-    _.error_flag = 0;
-
-    static uintptr_t base = 0;
-
-    if (!base)
-        GetNtoskrnlBaseAddress(reinterpret_cast<void**>(&base));
-
-    if (!base)
-    {
-        KeUnstackDetachProcess(&ApcState);
-        return STATUS_UNSUCCESSFUL;
-    }
-
-
-
-    static PiDqSerializationWrite_t func = FindPiDqSerializationWrite(base);
-
-    if (!func)
-    {
-        KeUnstackDetachProcess(&ApcState);
-        return STATUS_UNSUCCESSFUL;
-    }
-
-    func(&_, source, static_cast<unsigned int>(size));
-
-    if (_.error_flag)
-    {
-        KeUnstackDetachProcess(&ApcState);
-        return STATUS_UNSUCCESSFUL;
-    }
-
-    KeUnstackDetachProcess(&ApcState);
-    return STATUS_SUCCESS;
-}
 bool memory::ReadProcessVirtualMemory(HANDLE pid, PVOID address, PVOID buffer, SIZE_T size)
 {
-    if (!address || !buffer || !size || !pid)
+    if (!pid || !address || !buffer || !size || size > kMaxTransferSize)
         return false;
 
-    PEPROCESS process;
-
+    PEPROCESS process = nullptr;
     if (!NT_SUCCESS(PsLookupProcessByProcessId(pid, &process)))
         return false;
 
-    const auto status = NT_SUCCESS(read_memory(process, address, buffer, size));
-    ObDereferenceObject(process);
+    LockedUserRange lockedRange;
+    uint64_t cr3 = 0;
+    const NTSTATUS status = lockedRange.Lock(process, address, size, IoReadAccess, &cr3);
+    const bool copied = NT_SUCCESS(status) &&
+                        CopyTranslatedPhysicalMemory(cr3, reinterpret_cast<uintptr_t>(address), buffer, size, false);
 
-    return status;
+    ObDereferenceObject(process);
+    return copied;
 }
 
-
-bool memory::WriteProcessVirtualMemory(HANDLE pid, PVOID address, PVOID buffer, SIZE_T size)
+bool memory::WriteProcessVirtualMemory(HANDLE pid, PVOID sourceAddr, PVOID targetAddr, SIZE_T size)
 {
-    if (!address || !buffer || !size || !pid)
+    if (!pid || !sourceAddr || !targetAddr || !size || size > kMaxTransferSize)
         return false;
 
-    PEPROCESS process;
-
+    PEPROCESS process = nullptr;
     if (!NT_SUCCESS(PsLookupProcessByProcessId(pid, &process)))
         return false;
 
-    const auto status = NT_SUCCESS(read_memory(process, buffer, address, size));
-    ObDereferenceObject(process);
+    LockedUserRange lockedRange;
+    uint64_t cr3 = 0;
+    const NTSTATUS status = lockedRange.Lock(process, targetAddr, size, IoWriteAccess, &cr3);
+    const bool copied = NT_SUCCESS(status) && CopyTranslatedPhysicalMemory(cr3, reinterpret_cast<uintptr_t>(targetAddr),
+                                                                           sourceAddr, size, true);
 
-    return status;
+    ObDereferenceObject(process);
+    return copied;
 }
+
 uintptr_t memory::GetProcessModuleBase(HANDLE pid)
 {
-
-    PEPROCESS process;
+    PEPROCESS process = nullptr;
     if (!NT_SUCCESS(PsLookupProcessByProcessId(pid, &process)))
         return 0;
 
-    const auto status = reinterpret_cast<uintptr_t>(PsGetProcessSectionBaseAddress(process));
+    const auto baseAddress = reinterpret_cast<uintptr_t>(PsGetProcessSectionBaseAddress(process));
     ObDereferenceObject(process);
-    return status;
+    return baseAddress;
 }

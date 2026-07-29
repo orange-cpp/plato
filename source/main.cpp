@@ -35,7 +35,6 @@ public:
 };
 
 
-
 //--------------------------------------------------------------------------------------
 // Forward declarations
 //--------------------------------------------------------------------------------------
@@ -52,6 +51,9 @@ public:
 
     bool EnsureCapacity(size_t size)
     {
+        if (!size || size > memory::kMaxTransferSize)
+            return false;
+
         if (size <= m_capacity)
             return true;
 
@@ -94,10 +96,27 @@ static bool ReceiveAll(int client_sockfd, void* buffer, size_t size)
     return true;
 }
 
-static void HandleReadOperation(const ReadMemoryOperation* pReadParam, int client_sockfd, ClientBuffer& buffer);
-static void HandleWriteOperation(ReadMemoryOperation* pWriteParam, int client_sockfd, ClientBuffer& buffer);
-static void HandleProcessBaseOperation(ReadMemoryOperation* pBaseParam, int client_sockfd);
-static void HandleMouseMoveRelativeOperation(MouseMoveRelativeOperation* pMoveParam, int client_sockfd);
+static bool SendAll(int client_sockfd, const void* buffer, size_t size)
+{
+    auto* bytes = static_cast<const unsigned char*>(buffer);
+
+    while (size)
+    {
+        const int sent = send(client_sockfd, bytes, size, 0);
+        if (sent <= 0)
+            return false;
+
+        bytes += sent;
+        size -= static_cast<size_t>(sent);
+    }
+
+    return true;
+}
+
+static bool HandleReadOperation(const ReadMemoryOperation* pReadParam, int client_sockfd, ClientBuffer& buffer);
+static bool HandleWriteOperation(const ReadMemoryOperation* pWriteParam, int client_sockfd, ClientBuffer& buffer);
+static bool HandleProcessBaseOperation(const ReadMemoryOperation* pBaseParam, int client_sockfd);
+static bool HandleMouseMoveRelativeOperation(const MouseMoveRelativeOperation* pMoveParam, int client_sockfd);
 
 //--------------------------------------------------------------------------------------
 // Sets up the server socket and returns the listening socket file descriptor,
@@ -191,13 +210,11 @@ static NTSTATUS HandleClientSocket(int client_sockfd)
                     return STATUS_SUCCESS;
 
                 if (packet.m_iOperation == OPERATION::READ)
-                    HandleReadOperation(&packet, client_sockfd, buffer);
+                    success = HandleReadOperation(&packet, client_sockfd, buffer);
                 else if (packet.m_iOperation == OPERATION::WRITE)
-                    HandleWriteOperation(&packet, client_sockfd, buffer);
+                    success = HandleWriteOperation(&packet, client_sockfd, buffer);
                 else
-                    HandleProcessBaseOperation(&packet, client_sockfd);
-
-                success = true;
+                    success = HandleProcessBaseOperation(&packet, client_sockfd);
                 break;
             }
             case OPERATION::MOVE_MOUSE_RELATIVE:
@@ -211,8 +228,7 @@ static NTSTATUS HandleClientSocket(int client_sockfd)
                                 sizeof(packet) - sizeof(packetHeader)))
                     return STATUS_SUCCESS;
 
-                HandleMouseMoveRelativeOperation(&packet, client_sockfd);
-                success = true;
+                success = HandleMouseMoveRelativeOperation(&packet, client_sockfd);
                 break;
             }
         }
@@ -222,8 +238,8 @@ static NTSTATUS HandleClientSocket(int client_sockfd)
             constexpr bool bStatus = false;
             constexpr size_t szStatusSize = sizeof(bStatus);
 
-            send(client_sockfd, &szStatusSize, sizeof(szStatusSize), 0);
-            send(client_sockfd, &bStatus, sizeof(bStatus), 0);
+            SendAll(client_sockfd, &szStatusSize, sizeof(szStatusSize));
+            SendAll(client_sockfd, &bStatus, sizeof(bStatus));
             break;
         }
     }
@@ -234,38 +250,39 @@ static NTSTATUS HandleClientSocket(int client_sockfd)
 //--------------------------------------------------------------------------------------
 // READ operation handling
 //--------------------------------------------------------------------------------------
-static void HandleReadOperation(const ReadMemoryOperation* pReadParam, int client_sockfd, ClientBuffer& buffer)
+static bool HandleReadOperation(const ReadMemoryOperation* pReadParam, int client_sockfd, ClientBuffer& buffer)
 {
     // Reuse the connection buffer to hold the data we’ll read
     if (!buffer.EnsureCapacity(pReadParam->m_iSize))
-        return;
+        return false;
 
     auto pSendBuffer = buffer.Data();
     RtlZeroMemory(pSendBuffer, pReadParam->m_iSize);
 
     // Read data from target process memory
-    memory::ReadProcessVirtualMemory(reinterpret_cast<HANDLE>(pReadParam->m_procId),
-                                     reinterpret_cast<PVOID>(pReadParam->m_addr), pSendBuffer, pReadParam->m_iSize);
+    if (!memory::ReadProcessVirtualMemory(reinterpret_cast<HANDLE>(pReadParam->m_procId),
+                                          reinterpret_cast<PVOID>(pReadParam->m_addr), pSendBuffer,
+                                          pReadParam->m_iSize))
+        return false;
 
     // Send the size of the data and then the data
-    send(client_sockfd, &pReadParam->m_iSize, sizeof(size_t), 0);
-    send(client_sockfd, pSendBuffer, pReadParam->m_iSize, 0);
-
+    return SendAll(client_sockfd, &pReadParam->m_iSize, sizeof(pReadParam->m_iSize)) &&
+           SendAll(client_sockfd, pSendBuffer, pReadParam->m_iSize);
 }
 
 //--------------------------------------------------------------------------------------
 // WRITE operation handling
 //--------------------------------------------------------------------------------------
-static void HandleWriteOperation(ReadMemoryOperation* pWriteParam, int client_sockfd, ClientBuffer& buffer)
+static bool HandleWriteOperation(const ReadMemoryOperation* pWriteParam, int client_sockfd, ClientBuffer& buffer)
 {
     // Reuse the connection buffer to hold incoming data
     if (!buffer.EnsureCapacity(pWriteParam->m_iSize))
-        return;
+        return false;
 
     auto pWriteBuffer = buffer.Data();
     // Receive data that needs to be written to the target process memory
     if (!ReceiveAll(client_sockfd, pWriteBuffer, pWriteParam->m_iSize))
-        return;
+        return false;
 
     const bool bStatus =
             memory::WriteProcessVirtualMemory(reinterpret_cast<HANDLE>(pWriteParam->m_procId), pWriteBuffer,
@@ -273,15 +290,14 @@ static void HandleWriteOperation(ReadMemoryOperation* pWriteParam, int client_so
 
     constexpr size_t szStatusSize = sizeof(bStatus);
 
-    send(client_sockfd, &szStatusSize, sizeof(szStatusSize), 0);
-    send(client_sockfd, &bStatus, 1, 0);
-
+    return SendAll(client_sockfd, &szStatusSize, sizeof(szStatusSize)) &&
+           SendAll(client_sockfd, &bStatus, sizeof(bStatus));
 }
 
 //--------------------------------------------------------------------------------------
 // PROCESS_BASE operation handling
 //--------------------------------------------------------------------------------------
-static void HandleProcessBaseOperation(ReadMemoryOperation* pBaseParam, int client_sockfd)
+static bool HandleProcessBaseOperation(const ReadMemoryOperation* pBaseParam, int client_sockfd)
 {
     // Retrieve the base address of the target process's main module
     const auto procBase = memory::GetProcessModuleBase(reinterpret_cast<HANDLE>(pBaseParam->m_procId));
@@ -289,21 +305,20 @@ static void HandleProcessBaseOperation(ReadMemoryOperation* pBaseParam, int clie
     constexpr size_t baseSize = sizeof(procBase);
 
     // Send back the base address
-    send(client_sockfd, &baseSize, sizeof(size_t), 0);
-    send(client_sockfd, &procBase, sizeof(procBase), 0);
+    return SendAll(client_sockfd, &baseSize, sizeof(baseSize)) && SendAll(client_sockfd, &procBase, sizeof(procBase));
 }
 
 //--------------------------------------------------------------------------------------
 // MOUSE_MOVE_RELATIVE operation handling
 //--------------------------------------------------------------------------------------
-static void HandleMouseMoveRelativeOperation(MouseMoveRelativeOperation* pMoveParam, int client_sockfd)
+static bool HandleMouseMoveRelativeOperation(const MouseMoveRelativeOperation* pMoveParam, int client_sockfd)
 {
     const bool bStatus = mouse::MoveRelative(pMoveParam->m_x, pMoveParam->m_y);
 
     constexpr size_t szStatusSize = sizeof(bStatus);
 
-    send(client_sockfd, &szStatusSize, sizeof(szStatusSize), 0);
-    send(client_sockfd, &bStatus, 1, 0);
+    return SendAll(client_sockfd, &szStatusSize, sizeof(szStatusSize)) &&
+           SendAll(client_sockfd, &bStatus, sizeof(bStatus));
 }
 
 //--------------------------------------------------------------------------------------

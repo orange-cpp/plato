@@ -8,7 +8,7 @@ file(GLOB_RECURSE PLATO_HEADERS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/i
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake")
 
-# MmCopyMemory, used by the CR3 page-table walker, is available beginning with Windows 8.1.
+# MmCopyMemory, used by the physical PML4 scanner, is available beginning with Windows 8.1.
 set(WDK_WINVER "0x0603" CACHE STRING "Minimum Windows version supported by plato" FORCE)
 set(WDK_NTDDI_VERSION "0x06030000" CACHE STRING "Minimum NTDDI version supported by plato" FORCE)
 

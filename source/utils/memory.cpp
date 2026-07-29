@@ -1,7 +1,5 @@
 #include "plato/utils/memory.hpp"
 
-#include <intrin.h>
-
 extern "C" NTKERNELAPI PVOID NTAPI PsGetProcessSectionBaseAddress(_In_ PEPROCESS Process);
 
 namespace
@@ -17,6 +15,8 @@ namespace
     constexpr uint64_t kTwoMegabytePageMask = kPhysicalPageMask & ~((1ULL << 21) - 1);
     constexpr uint64_t kOneGigabytePageMask = kPhysicalPageMask & ~((1ULL << 30) - 1);
 
+    alignas(sizeof(LONG64)) volatile LONG64 g_lastPageTableRoot = 0;
+
     class LockedUserRange final
     {
     public:
@@ -30,9 +30,9 @@ namespace
         LockedUserRange(const LockedUserRange&) = delete;
         LockedUserRange& operator=(const LockedUserRange&) = delete;
 
-        NTSTATUS Lock(PEPROCESS process, PVOID address, SIZE_T size, LOCK_OPERATION operation, uint64_t* cr3)
+        NTSTATUS Lock(PEPROCESS process, PVOID address, SIZE_T size, LOCK_OPERATION operation)
         {
-            if (!process || !address || !size || size > memory::kMaxTransferSize || !cr3)
+            if (!process || !address || !size || size > memory::kMaxTransferSize)
                 return STATUS_INVALID_PARAMETER;
 
             m_mdl = IoAllocateMdl(address, static_cast<ULONG>(size), FALSE, FALSE, nullptr);
@@ -46,13 +46,9 @@ namespace
             __try
             {
                 // The target buffer is a user-mode address in the attached process. Locking it prevents its
-                // physical frames from being released or remapped while the CR3 walk and physical copy run.
+                // physical frames from being released or remapped while the PML4 search and physical copy run.
                 MmProbeAndLockPages(m_mdl, UserMode, operation);
                 m_locked = true;
-
-                *cr3 = __readcr3() & kPhysicalPageMask;
-                if (!*cr3)
-                    status = STATUS_UNSUCCESSFUL;
             } __except (EXCEPTION_EXECUTE_HANDLER)
             {
                 status = GetExceptionCode();
@@ -63,6 +59,11 @@ namespace
                 Reset();
 
             return status;
+        }
+
+        PMDL GetMdl() const
+        {
+            return m_mdl;
         }
 
     private:
@@ -106,9 +107,10 @@ namespace
         return ReadPhysicalMemory(tablePhysicalAddress + index * sizeof(*entry), entry, sizeof(*entry));
     }
 
-    bool TranslateVirtualAddress(uint64_t cr3, uint64_t virtualAddress, uint64_t* physicalAddress)
+    bool TranslateVirtualAddress(uint64_t pageTableRoot, uint64_t virtualAddress, uint64_t* physicalAddress)
     {
-        if (!IsCanonicalAddress(virtualAddress) || !physicalAddress)
+        if (!(pageTableRoot & kPhysicalPageMask) || (pageTableRoot & kPageMask) ||
+            !IsCanonicalAddress(virtualAddress) || !physicalAddress)
             return false;
 
         const uint64_t pml4Index = (virtualAddress >> 39) & kPageTableIndexMask;
@@ -117,7 +119,8 @@ namespace
         const uint64_t ptIndex = (virtualAddress >> 12) & kPageTableIndexMask;
 
         uint64_t pml4e = 0;
-        if (!ReadPageTableEntry(cr3, pml4Index, &pml4e) || !(pml4e & kPagePresent))
+        if (!ReadPageTableEntry(pageTableRoot, pml4Index, &pml4e) || !(pml4e & kPagePresent) ||
+            (pml4e & kLargePage))
             return false;
 
         uint64_t pdpte = 0;
@@ -148,6 +151,91 @@ namespace
         return true;
     }
 
+    bool PageTableMapsLockedRange(uint64_t pageTableRoot, PMDL mdl)
+    {
+        if (!mdl)
+            return false;
+
+        const auto virtualAddress = reinterpret_cast<uint64_t>(MmGetMdlVirtualAddress(mdl));
+        const SIZE_T byteCount = MmGetMdlByteCount(mdl);
+        if (!byteCount || !IsCanonicalAddress(virtualAddress))
+            return false;
+
+        const SIZE_T pageCount = ADDRESS_AND_SIZE_TO_SPAN_PAGES(virtualAddress, byteCount);
+        const PPFN_NUMBER pageFrames = MmGetMdlPfnArray(mdl);
+        uint64_t virtualPage = virtualAddress & ~kPageMask;
+
+        for (SIZE_T pageIndex = 0; pageIndex < pageCount; ++pageIndex)
+        {
+            uint64_t physicalAddress = 0;
+            if (!TranslateVirtualAddress(pageTableRoot, virtualPage, &physicalAddress) ||
+                (physicalAddress >> PAGE_SHIFT) != pageFrames[pageIndex])
+                return false;
+
+            virtualPage += kPageSize;
+        }
+
+        return true;
+    }
+
+    bool FindPageTableRoot(PMDL mdl, uint64_t* pageTableRoot)
+    {
+        if (!mdl || !pageTableRoot || KeGetCurrentIrql() != PASSIVE_LEVEL)
+            return false;
+
+        const auto cachedRoot =
+                static_cast<uint64_t>(InterlockedCompareExchange64(&g_lastPageTableRoot, 0, 0));
+        if (cachedRoot && PageTableMapsLockedRange(cachedRoot, mdl))
+        {
+            *pageTableRoot = cachedRoot;
+            return true;
+        }
+
+        PPHYSICAL_MEMORY_RANGE ranges = MmGetPhysicalMemoryRanges();
+        if (!ranges)
+            return false;
+
+        uint64_t foundRoot = 0;
+
+        for (PPHYSICAL_MEMORY_RANGE range = ranges; range->NumberOfBytes.QuadPart != 0 && !foundRoot; ++range)
+        {
+            if (range->BaseAddress.QuadPart < 0 || range->NumberOfBytes.QuadPart < 0)
+                continue;
+
+            const uint64_t base = static_cast<uint64_t>(range->BaseAddress.QuadPart);
+            const uint64_t length = static_cast<uint64_t>(range->NumberOfBytes.QuadPart);
+            if (length < kPageSize || base > UINT64_MAX - length || base > UINT64_MAX - kPageMask)
+                continue;
+
+            const uint64_t rangeEnd = base + length;
+            const uint64_t firstPage = (base + kPageMask) & ~kPageMask;
+            const uint64_t lastPage = rangeEnd - kPageSize;
+
+            for (uint64_t candidate = firstPage; candidate <= lastPage;)
+            {
+                if (PageTableMapsLockedRange(candidate, mdl))
+                {
+                    foundRoot = candidate;
+                    break;
+                }
+
+                if (lastPage - candidate < kPageSize)
+                    break;
+
+                candidate += kPageSize;
+            }
+        }
+
+        ExFreePool(ranges);
+
+        if (!foundRoot)
+            return false;
+
+        InterlockedExchange64(&g_lastPageTableRoot, static_cast<LONG64>(foundRoot));
+        *pageTableRoot = foundRoot;
+        return true;
+    }
+
     bool WritePhysicalMemory(uint64_t physicalAddress, const void* buffer, SIZE_T size)
     {
         const uint64_t physicalPage = physicalAddress & ~kPageMask;
@@ -166,14 +254,15 @@ namespace
         return true;
     }
 
-    bool CopyTranslatedPhysicalMemory(uint64_t cr3, uint64_t virtualAddress, void* buffer, SIZE_T size, bool write)
+    bool CopyTranslatedPhysicalMemory(uint64_t pageTableRoot, uint64_t virtualAddress, void* buffer, SIZE_T size,
+                                      bool write)
     {
         auto* bytes = static_cast<unsigned char*>(buffer);
 
         while (size)
         {
             uint64_t physicalAddress = 0;
-            if (!TranslateVirtualAddress(cr3, virtualAddress, &physicalAddress))
+            if (!TranslateVirtualAddress(pageTableRoot, virtualAddress, &physicalAddress))
                 return false;
 
             const SIZE_T bytesToPageBoundary = static_cast<SIZE_T>(kPageSize - (physicalAddress & kPageMask));
@@ -202,10 +291,11 @@ bool memory::ReadProcessVirtualMemory(HANDLE pid, PVOID address, PVOID buffer, S
         return false;
 
     LockedUserRange lockedRange;
-    uint64_t cr3 = 0;
-    const NTSTATUS status = lockedRange.Lock(process, address, size, IoReadAccess, &cr3);
-    const bool copied = NT_SUCCESS(status) &&
-                        CopyTranslatedPhysicalMemory(cr3, reinterpret_cast<uintptr_t>(address), buffer, size, false);
+    uint64_t pageTableRoot = 0;
+    const NTSTATUS status = lockedRange.Lock(process, address, size, IoReadAccess);
+    const bool copied = NT_SUCCESS(status) && FindPageTableRoot(lockedRange.GetMdl(), &pageTableRoot) &&
+                        CopyTranslatedPhysicalMemory(pageTableRoot, reinterpret_cast<uintptr_t>(address), buffer, size,
+                                                     false);
 
     ObDereferenceObject(process);
     return copied;
@@ -221,10 +311,11 @@ bool memory::WriteProcessVirtualMemory(HANDLE pid, PVOID sourceAddr, PVOID targe
         return false;
 
     LockedUserRange lockedRange;
-    uint64_t cr3 = 0;
-    const NTSTATUS status = lockedRange.Lock(process, targetAddr, size, IoWriteAccess, &cr3);
-    const bool copied = NT_SUCCESS(status) && CopyTranslatedPhysicalMemory(cr3, reinterpret_cast<uintptr_t>(targetAddr),
-                                                                           sourceAddr, size, true);
+    uint64_t pageTableRoot = 0;
+    const NTSTATUS status = lockedRange.Lock(process, targetAddr, size, IoWriteAccess);
+    const bool copied = NT_SUCCESS(status) && FindPageTableRoot(lockedRange.GetMdl(), &pageTableRoot) &&
+                        CopyTranslatedPhysicalMemory(pageTableRoot, reinterpret_cast<uintptr_t>(targetAddr), sourceAddr,
+                                                     size, true);
 
     ObDereferenceObject(process);
     return copied;

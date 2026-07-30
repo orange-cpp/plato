@@ -11,8 +11,9 @@ namespace
     constexpr uint64_t kPagePresent = 1;
     constexpr uint64_t kLargePage = 1ULL << 7;
     constexpr ACCESS_MASK kProcessQueryInformation = 0x0400;
-    constexpr SIZE_T kValidationAnchorSize = 64;
-    constexpr SIZE_T kMaxValidationAnchors = 3;
+    constexpr uint64_t kPebValidationOffset = 0x10;
+    constexpr SIZE_T kValidationAnchorSize = 48;
+    constexpr SIZE_T kMaxValidationAnchors = 1;
 
     // Four-level x64 paging reserves bits 12-51 of a page-table entry for the physical frame number.
     constexpr uint64_t kPhysicalPageMask = 0x000F'FFFF'FFFF'F000ULL;
@@ -134,6 +135,33 @@ namespace
         return NT_SUCCESS(status) && bytesCopied == size;
     }
 
+    bool ValidateProcessVirtualRangeSafely(PEPROCESS process, PVOID address, SIZE_T size)
+    {
+        if (!process || !address || !size)
+            return false;
+
+        const auto rangeStart = reinterpret_cast<uint64_t>(address);
+        const uint64_t rangeEnd = rangeStart + size;
+        uint64_t currentAddress = rangeStart;
+        unsigned char byte = 0;
+
+        while (currentAddress < rangeEnd)
+        {
+            if (!CopyProcessVirtualMemorySafely(process, currentAddress, &byte, sizeof(byte)))
+                return false;
+
+            const uint64_t nextPage = (currentAddress & ~kPageMask) + kPageSize;
+            if (nextPage <= currentAddress || nextPage >= rangeEnd)
+                break;
+
+            currentAddress = nextPage;
+        }
+
+        const uint64_t lastAddress = rangeEnd - 1;
+        return lastAddress == currentAddress ||
+               CopyProcessVirtualMemorySafely(process, lastAddress, &byte, sizeof(byte));
+    }
+
     bool ReadPhysicalMemory(uint64_t physicalAddress, void* buffer, SIZE_T size)
     {
         MM_COPY_ADDRESS source{};
@@ -213,27 +241,22 @@ namespace
         return true;
     }
 
-    bool CapturePageTableValidation(PEPROCESS process, PVOID address, SIZE_T size,
-                                    PageTableValidation* validation)
+    bool CapturePageTableValidation(PEPROCESS process, PageTableValidation* validation)
     {
-        if (!process || !address || !size || !validation)
+        if (!process || !validation)
             return false;
 
-        const auto rangeStart = reinterpret_cast<uint64_t>(address);
         const auto pebAddress = reinterpret_cast<uint64_t>(PsGetProcessPeb(process));
         const auto highestUserAddress = reinterpret_cast<uint64_t>(MmHighestUserAddress);
         if (!pebAddress || pebAddress > highestUserAddress ||
-            kValidationAnchorSize - 1 > highestUserAddress - pebAddress ||
-            !CaptureValidationAnchor(process, pebAddress, kValidationAnchorSize, validation))
+            kPebValidationOffset > highestUserAddress - pebAddress)
             return false;
 
-        const SIZE_T targetAnchorSize = size < kValidationAnchorSize ? size : kValidationAnchorSize;
-        if (!CaptureValidationAnchor(process, rangeStart, targetAnchorSize, validation))
+        const uint64_t anchorAddress = pebAddress + kPebValidationOffset;
+        if (kValidationAnchorSize - 1 > highestUserAddress - anchorAddress)
             return false;
 
-        const uint64_t rangeEndAnchor = rangeStart + size - targetAnchorSize;
-        return rangeEndAnchor == rangeStart ||
-               CaptureValidationAnchor(process, rangeEndAnchor, targetAnchorSize, validation);
+        return CaptureValidationAnchor(process, anchorAddress, kValidationAnchorSize, validation);
     }
 
     bool PageTableMatchesValidation(uint64_t pageTableRoot, const PageTableValidation& validation)
@@ -368,7 +391,8 @@ bool memory::ReadProcessVirtualMemory(HANDLE pid, PVOID address, PVOID buffer, S
     PageTableValidation validation{};
     uint64_t pageTableRoot = 0;
     const bool copied = IsReadableUserRange(process, address, size) &&
-                        CapturePageTableValidation(process, address, size, &validation) &&
+                        ValidateProcessVirtualRangeSafely(process, address, size) &&
+                        CapturePageTableValidation(process, &validation) &&
                         FindPageTableRoot(validation, &pageTableRoot) &&
                         CopyTranslatedPhysicalMemory(pageTableRoot, reinterpret_cast<uintptr_t>(address), buffer, size,
                                                      false);
@@ -389,7 +413,8 @@ bool memory::ForceWriteProcessVirtualMemory(HANDLE pid, PVOID sourceAddr, PVOID 
     PageTableValidation validation{};
     uint64_t pageTableRoot = 0;
     const bool copied = IsReadableUserRange(process, targetAddr, size) &&
-                        CapturePageTableValidation(process, targetAddr, size, &validation) &&
+                        ValidateProcessVirtualRangeSafely(process, targetAddr, size) &&
+                        CapturePageTableValidation(process, &validation) &&
                         FindPageTableRoot(validation, &pageTableRoot) &&
                         PageTableMatchesValidation(pageTableRoot, validation) &&
                         CopyTranslatedPhysicalMemory(pageTableRoot, reinterpret_cast<uintptr_t>(targetAddr), sourceAddr,

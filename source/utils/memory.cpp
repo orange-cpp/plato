@@ -1,6 +1,7 @@
 #include "plato/utils/memory.hpp"
 
 extern "C" NTKERNELAPI PVOID NTAPI PsGetProcessSectionBaseAddress(_In_ PEPROCESS Process);
+extern "C" NTKERNELAPI PVOID NTAPI PsGetProcessPeb(_In_ PEPROCESS Process);
 
 namespace
 {
@@ -10,6 +11,8 @@ namespace
     constexpr uint64_t kPagePresent = 1;
     constexpr uint64_t kLargePage = 1ULL << 7;
     constexpr ACCESS_MASK kProcessQueryInformation = 0x0400;
+    constexpr SIZE_T kValidationAnchorSize = 64;
+    constexpr SIZE_T kMaxValidationAnchors = 3;
 
     // Four-level x64 paging reserves bits 12-51 of a page-table entry for the physical frame number.
     constexpr uint64_t kPhysicalPageMask = 0x000F'FFFF'FFFF'F000ULL;
@@ -18,73 +21,17 @@ namespace
 
     alignas(sizeof(LONG64)) volatile LONG64 g_lastPageTableRoot = 0;
 
-    class LockedUserRange final
+    struct ValidationAnchor
     {
-    public:
-        LockedUserRange() = default;
+        uint64_t virtualAddress{};
+        SIZE_T size{};
+        unsigned char bytes[kValidationAnchorSize]{};
+    };
 
-        ~LockedUserRange()
-        {
-            Reset();
-        }
-
-        LockedUserRange(const LockedUserRange&) = delete;
-        LockedUserRange& operator=(const LockedUserRange&) = delete;
-
-        NTSTATUS Lock(PEPROCESS process, PVOID address, SIZE_T size, LOCK_OPERATION operation)
-        {
-            if (!process || !address || !size || size > memory::kMaxTransferSize)
-                return STATUS_INVALID_PARAMETER;
-
-            m_mdl = IoAllocateMdl(address, static_cast<ULONG>(size), FALSE, FALSE, nullptr);
-            if (!m_mdl)
-                return STATUS_INSUFFICIENT_RESOURCES;
-
-            KAPC_STATE apcState{};
-            NTSTATUS status = STATUS_SUCCESS;
-
-            KeStackAttachProcess(process, &apcState);
-            __try
-            {
-                // The target buffer is a user-mode address in the attached process. Locking it prevents its
-                // physical frames from being released or remapped while the PML4 search and physical copy run.
-                MmProbeAndLockPages(m_mdl, UserMode, operation);
-                m_locked = true;
-            } __except (EXCEPTION_EXECUTE_HANDLER)
-            {
-                status = GetExceptionCode();
-            }
-            KeUnstackDetachProcess(&apcState);
-
-            if (!NT_SUCCESS(status))
-                Reset();
-
-            return status;
-        }
-
-        PMDL GetMdl() const
-        {
-            return m_mdl;
-        }
-
-    private:
-        void Reset()
-        {
-            if (m_locked)
-            {
-                MmUnlockPages(m_mdl);
-                m_locked = false;
-            }
-
-            if (m_mdl)
-            {
-                IoFreeMdl(m_mdl);
-                m_mdl = nullptr;
-            }
-        }
-
-        PMDL m_mdl{};
-        bool m_locked{};
+    struct PageTableValidation
+    {
+        ValidationAnchor anchors[kMaxValidationAnchors]{};
+        SIZE_T count{};
     };
 
     bool IsCanonicalAddress(uint64_t address)
@@ -168,6 +115,25 @@ namespace
         return readable;
     }
 
+    bool CopyProcessVirtualMemorySafely(PEPROCESS process, uint64_t virtualAddress, void* buffer, SIZE_T size)
+    {
+        if (!process || !virtualAddress || !buffer || !size || KeGetCurrentIrql() > APC_LEVEL)
+            return false;
+
+        KAPC_STATE apcState{};
+        KeStackAttachProcess(process, &apcState);
+
+        MM_COPY_ADDRESS source{};
+        source.VirtualAddress = reinterpret_cast<PVOID>(virtualAddress);
+
+        SIZE_T bytesCopied = 0;
+        const NTSTATUS status =
+                MmCopyMemory(buffer, source, size, MM_COPY_MEMORY_VIRTUAL, &bytesCopied);
+
+        KeUnstackDetachProcess(&apcState);
+        return NT_SUCCESS(status) && bytesCopied == size;
+    }
+
     bool ReadPhysicalMemory(uint64_t physicalAddress, void* buffer, SIZE_T size)
     {
         MM_COPY_ADDRESS source{};
@@ -227,41 +193,74 @@ namespace
         return true;
     }
 
-    bool PageTableMapsLockedRange(uint64_t pageTableRoot, PMDL mdl)
+    bool CopyTranslatedPhysicalMemory(uint64_t pageTableRoot, uint64_t virtualAddress, void* buffer, SIZE_T size,
+                                      bool write);
+
+    bool CaptureValidationAnchor(PEPROCESS process, uint64_t virtualAddress, SIZE_T size,
+                                 PageTableValidation* validation)
     {
-        if (!mdl)
+        if (!process || !virtualAddress || !size || !validation || validation->count >= kMaxValidationAnchors)
             return false;
 
-        const auto virtualAddress = reinterpret_cast<uint64_t>(MmGetMdlVirtualAddress(mdl));
-        const SIZE_T byteCount = MmGetMdlByteCount(mdl);
-        if (!byteCount || !IsCanonicalAddress(virtualAddress))
+        ValidationAnchor& anchor = validation->anchors[validation->count];
+        anchor.virtualAddress = virtualAddress;
+        anchor.size = size < kValidationAnchorSize ? size : kValidationAnchorSize;
+
+        if (!CopyProcessVirtualMemorySafely(process, anchor.virtualAddress, anchor.bytes, anchor.size))
             return false;
 
-        const SIZE_T pageCount = ADDRESS_AND_SIZE_TO_SPAN_PAGES(virtualAddress, byteCount);
-        const PPFN_NUMBER pageFrames = MmGetMdlPfnArray(mdl);
-        uint64_t virtualPage = virtualAddress & ~kPageMask;
+        ++validation->count;
+        return true;
+    }
 
-        for (SIZE_T pageIndex = 0; pageIndex < pageCount; ++pageIndex)
+    bool CapturePageTableValidation(PEPROCESS process, PVOID address, SIZE_T size,
+                                    PageTableValidation* validation)
+    {
+        if (!process || !address || !size || !validation)
+            return false;
+
+        const auto rangeStart = reinterpret_cast<uint64_t>(address);
+        const auto pebAddress = reinterpret_cast<uint64_t>(PsGetProcessPeb(process));
+        const auto highestUserAddress = reinterpret_cast<uint64_t>(MmHighestUserAddress);
+        if (!pebAddress || pebAddress > highestUserAddress ||
+            kValidationAnchorSize - 1 > highestUserAddress - pebAddress ||
+            !CaptureValidationAnchor(process, pebAddress, kValidationAnchorSize, validation))
+            return false;
+
+        const SIZE_T targetAnchorSize = size < kValidationAnchorSize ? size : kValidationAnchorSize;
+        if (!CaptureValidationAnchor(process, rangeStart, targetAnchorSize, validation))
+            return false;
+
+        const uint64_t rangeEndAnchor = rangeStart + size - targetAnchorSize;
+        return rangeEndAnchor == rangeStart ||
+               CaptureValidationAnchor(process, rangeEndAnchor, targetAnchorSize, validation);
+    }
+
+    bool PageTableMatchesValidation(uint64_t pageTableRoot, const PageTableValidation& validation)
+    {
+        if (!validation.count)
+            return false;
+
+        unsigned char bytes[kValidationAnchorSize]{};
+        for (SIZE_T index = 0; index < validation.count; ++index)
         {
-            uint64_t physicalAddress = 0;
-            if (!TranslateVirtualAddress(pageTableRoot, virtualPage, &physicalAddress) ||
-                (physicalAddress >> PAGE_SHIFT) != pageFrames[pageIndex])
+            const ValidationAnchor& anchor = validation.anchors[index];
+            if (!CopyTranslatedPhysicalMemory(pageTableRoot, anchor.virtualAddress, bytes, anchor.size, false) ||
+                RtlCompareMemory(bytes, anchor.bytes, anchor.size) != anchor.size)
                 return false;
-
-            virtualPage += kPageSize;
         }
 
         return true;
     }
 
-    bool FindPageTableRoot(PMDL mdl, uint64_t* pageTableRoot)
+    bool FindPageTableRoot(const PageTableValidation& validation, uint64_t* pageTableRoot)
     {
-        if (!mdl || !pageTableRoot || KeGetCurrentIrql() != PASSIVE_LEVEL)
+        if (!validation.count || !pageTableRoot || KeGetCurrentIrql() != PASSIVE_LEVEL)
             return false;
 
         const auto cachedRoot =
                 static_cast<uint64_t>(InterlockedCompareExchange64(&g_lastPageTableRoot, 0, 0));
-        if (cachedRoot && PageTableMapsLockedRange(cachedRoot, mdl))
+        if (cachedRoot && PageTableMatchesValidation(cachedRoot, validation))
         {
             *pageTableRoot = cachedRoot;
             return true;
@@ -289,7 +288,7 @@ namespace
 
             for (uint64_t candidate = firstPage; candidate <= lastPage;)
             {
-                if (PageTableMapsLockedRange(candidate, mdl))
+                if (PageTableMatchesValidation(candidate, validation))
                 {
                     foundRoot = candidate;
                     break;
@@ -366,10 +365,11 @@ bool memory::ReadProcessVirtualMemory(HANDLE pid, PVOID address, PVOID buffer, S
     if (!NT_SUCCESS(PsLookupProcessByProcessId(pid, &process)))
         return false;
 
-    LockedUserRange lockedRange;
+    PageTableValidation validation{};
     uint64_t pageTableRoot = 0;
-    const NTSTATUS status = lockedRange.Lock(process, address, size, IoReadAccess);
-    const bool copied = NT_SUCCESS(status) && FindPageTableRoot(lockedRange.GetMdl(), &pageTableRoot) &&
+    const bool copied = IsReadableUserRange(process, address, size) &&
+                        CapturePageTableValidation(process, address, size, &validation) &&
+                        FindPageTableRoot(validation, &pageTableRoot) &&
                         CopyTranslatedPhysicalMemory(pageTableRoot, reinterpret_cast<uintptr_t>(address), buffer, size,
                                                      false);
 
@@ -386,12 +386,12 @@ bool memory::ForceWriteProcessVirtualMemory(HANDLE pid, PVOID sourceAddr, PVOID 
     if (!NT_SUCCESS(PsLookupProcessByProcessId(pid, &process)))
         return false;
 
-    LockedUserRange lockedRange;
+    PageTableValidation validation{};
     uint64_t pageTableRoot = 0;
-    const NTSTATUS status = IsReadableUserRange(process, targetAddr, size)
-                                    ? lockedRange.Lock(process, targetAddr, size, IoReadAccess)
-                                    : STATUS_ACCESS_DENIED;
-    const bool copied = NT_SUCCESS(status) && FindPageTableRoot(lockedRange.GetMdl(), &pageTableRoot) &&
+    const bool copied = IsReadableUserRange(process, targetAddr, size) &&
+                        CapturePageTableValidation(process, targetAddr, size, &validation) &&
+                        FindPageTableRoot(validation, &pageTableRoot) &&
+                        PageTableMatchesValidation(pageTableRoot, validation) &&
                         CopyTranslatedPhysicalMemory(pageTableRoot, reinterpret_cast<uintptr_t>(targetAddr), sourceAddr,
                                                      size, true);
 

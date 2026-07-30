@@ -24,6 +24,8 @@ set_target_properties(${PROJECT_NAME} PROPERTIES
 
 add_subdirectory(extlibs)
 add_subdirectory(source)
+add_subdirectory(client)
+add_subdirectory(examples)
 
 
 target_link_libraries(${PROJECT_NAME} WDK::NETIO ksocket)

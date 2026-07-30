@@ -8,7 +8,7 @@ typedef unsigned char uint8_t;
 enum class OPERATION
 {
     READ,
-    WRITE,
+    WRITE_FORCE,
     PROCESS_BASE,
     MOVE_MOUSE_RELATIVE,
 };
@@ -35,16 +35,88 @@ public:
 };
 
 
-
 //--------------------------------------------------------------------------------------
 // Forward declarations
 //--------------------------------------------------------------------------------------
 static NTSTATUS HandleClientSocket(int client_sockfd);
-static bool HandlePacket(BasePacket* pPacket, int client_sockfd);
-static void HandleReadOperation(const ReadMemoryOperation* pReadParam, int client_sockfd);
-static void HandleWriteOperation(ReadMemoryOperation* pWriteParam, int client_sockfd);
-static void HandleProcessBaseOperation(ReadMemoryOperation* pBaseParam, int client_sockfd);
-static void HandleMouseMoveRelativeOperation(MouseMoveRelativeOperation* pMoveParam, int client_sockfd);
+
+class ClientBuffer final
+{
+public:
+    ~ClientBuffer()
+    {
+        if (m_data)
+            ExFreePoolWithTag(m_data, 'pac');
+    }
+
+    bool EnsureCapacity(size_t size)
+    {
+        if (!size || size > memory::kMaxTransferSize)
+            return false;
+
+        if (size <= m_capacity)
+            return true;
+
+        auto newData = ExAllocatePoolWithTag(NonPagedPool, size, 'pac');
+        if (!newData)
+            return false;
+
+        if (m_data)
+            ExFreePoolWithTag(m_data, 'pac');
+
+        m_data = newData;
+        m_capacity = size;
+        return true;
+    }
+
+    PVOID Data() const
+    {
+        return m_data;
+    }
+
+private:
+    PVOID m_data{};
+    size_t m_capacity{};
+};
+
+static bool ReceiveAll(int client_sockfd, void* buffer, size_t size)
+{
+    auto* bytes = static_cast<unsigned char*>(buffer);
+
+    while (size)
+    {
+        const int received = recv(client_sockfd, bytes, size, 0);
+        if (received <= 0)
+            return false;
+
+        bytes += received;
+        size -= static_cast<size_t>(received);
+    }
+
+    return true;
+}
+
+static bool SendAll(int client_sockfd, const void* buffer, size_t size)
+{
+    auto* bytes = static_cast<const unsigned char*>(buffer);
+
+    while (size)
+    {
+        const int sent = send(client_sockfd, bytes, size, 0);
+        if (sent <= 0)
+            return false;
+
+        bytes += sent;
+        size -= static_cast<size_t>(sent);
+    }
+
+    return true;
+}
+
+static bool HandleReadOperation(const ReadMemoryOperation* pReadParam, int client_sockfd, ClientBuffer& buffer);
+static bool HandleForceWriteOperation(const ReadMemoryOperation* pWriteParam, int client_sockfd, ClientBuffer& buffer);
+static bool HandleProcessBaseOperation(const ReadMemoryOperation* pBaseParam, int client_sockfd);
+static bool HandleMouseMoveRelativeOperation(const MouseMoveRelativeOperation* pMoveParam, int client_sockfd);
 
 //--------------------------------------------------------------------------------------
 // Sets up the server socket and returns the listening socket file descriptor,
@@ -106,134 +178,126 @@ static int SetupServerSocket(uint16_t port)
 //--------------------------------------------------------------------------------------
 static NTSTATUS HandleClientSocket(int client_sockfd)
 {
+    ClientBuffer buffer;
 
     while (true)
     {
         size_t szSizeOfPacket = 0;
 
         // First receive the size of the incoming packet
-        if (recv(client_sockfd, &szSizeOfPacket, sizeof(szSizeOfPacket), 0) <= 0)
+        if (!ReceiveAll(client_sockfd, &szSizeOfPacket, sizeof(szSizeOfPacket)))
             break; // Client disconnected or error
 
-        // Allocate space for the packet
-        const auto pPacket = static_cast<BasePacket*>(ExAllocatePoolWithTag(NonPagedPool, szSizeOfPacket, 'pac'));
-        if (!pPacket)
-            break; // Allocation failed
+        BasePacket packetHeader{};
+        if (!ReceiveAll(client_sockfd, &packetHeader, sizeof(packetHeader)))
+            break; // Client disconnected or error
 
-        // Receive the actual packet
-        if (recv(client_sockfd, pPacket, szSizeOfPacket, 0) <= 0)
+        bool success = false;
+
+        switch (packetHeader.m_iOperation)
         {
-            ExFreePoolWithTag(pPacket, 'pac');
-            break; // Client disconnected or error
+            case OPERATION::READ:
+            case OPERATION::WRITE_FORCE:
+            case OPERATION::PROCESS_BASE:
+            {
+                if (szSizeOfPacket != sizeof(ReadMemoryOperation))
+                    break;
+
+                ReadMemoryOperation packet{};
+                packet.m_iOperation = packetHeader.m_iOperation;
+                if (!ReceiveAll(client_sockfd, reinterpret_cast<unsigned char*>(&packet) + sizeof(packetHeader),
+                                sizeof(packet) - sizeof(packetHeader)))
+                    return STATUS_SUCCESS;
+
+                if (packet.m_iOperation == OPERATION::READ)
+                    success = HandleReadOperation(&packet, client_sockfd, buffer);
+                else if (packet.m_iOperation == OPERATION::WRITE_FORCE)
+                    success = HandleForceWriteOperation(&packet, client_sockfd, buffer);
+                else
+                    success = HandleProcessBaseOperation(&packet, client_sockfd);
+                break;
+            }
+            case OPERATION::MOVE_MOUSE_RELATIVE:
+            {
+                if (szSizeOfPacket != sizeof(MouseMoveRelativeOperation))
+                    break;
+
+                MouseMoveRelativeOperation packet{};
+                packet.m_iOperation = packetHeader.m_iOperation;
+                if (!ReceiveAll(client_sockfd, reinterpret_cast<unsigned char*>(&packet) + sizeof(packetHeader),
+                                sizeof(packet) - sizeof(packetHeader)))
+                    return STATUS_SUCCESS;
+
+                success = HandleMouseMoveRelativeOperation(&packet, client_sockfd);
+                break;
+            }
         }
 
-        // Process the packet and free it
-        const bool success = HandlePacket(pPacket, client_sockfd);
-        ExFreePoolWithTag(pPacket, 'pac');
-
-
         if (!success)
+        {
+            constexpr bool bStatus = false;
+            constexpr size_t szStatusSize = sizeof(bStatus);
+
+            SendAll(client_sockfd, &szStatusSize, sizeof(szStatusSize));
+            SendAll(client_sockfd, &bStatus, sizeof(bStatus));
             break;
+        }
     }
 
     return STATUS_SUCCESS;
 }
 
 //--------------------------------------------------------------------------------------
-// Routes a received packet to the appropriate handler based on operation
-// Returns false if an unknown operation is encountered or if an error occurs
-//--------------------------------------------------------------------------------------
-static bool HandlePacket(BasePacket* pPacket, int client_sockfd)
-{
-    switch (pPacket->m_iOperation)
-    {
-        case OPERATION::READ:
-        {
-            auto pReadParam = reinterpret_cast<ReadMemoryOperation*>(pPacket);
-            HandleReadOperation(pReadParam, client_sockfd);
-
-            return true;
-        }
-        case OPERATION::WRITE:
-        {
-            auto pWriteParam = reinterpret_cast<ReadMemoryOperation*>(pPacket);
-            HandleWriteOperation(pWriteParam, client_sockfd);
-            return true;
-        }
-        case OPERATION::PROCESS_BASE:
-        {
-            auto pBaseParam = reinterpret_cast<ReadMemoryOperation*>(pPacket);
-            HandleProcessBaseOperation(pBaseParam, client_sockfd);
-            return true;
-        }
-        case OPERATION::MOVE_MOUSE_RELATIVE:
-        {
-            auto pMoveParam = reinterpret_cast<MouseMoveRelativeOperation*>(pPacket);
-            HandleMouseMoveRelativeOperation(pMoveParam, client_sockfd);
-            return true;
-        }
-    }
-    // Unknown operation: send failure response
-    constexpr bool bStatus = false;
-    constexpr size_t szStatusSize = sizeof(bStatus);
-
-    send(client_sockfd, &szStatusSize, sizeof(szStatusSize), 0);
-    send(client_sockfd, &bStatus, 1, 0);
-    return false;
-}
-
-//--------------------------------------------------------------------------------------
 // READ operation handling
 //--------------------------------------------------------------------------------------
-static void HandleReadOperation(const ReadMemoryOperation* pReadParam, int client_sockfd)
+static bool HandleReadOperation(const ReadMemoryOperation* pReadParam, int client_sockfd, ClientBuffer& buffer)
 {
-    // Allocate buffer to hold the data we’ll read
-    auto pSendBuffer = ExAllocatePoolWithTag(NonPagedPool, pReadParam->m_iSize, 'pac');
-    if (!pSendBuffer)
-        return;
+    // Reuse the connection buffer to hold the data we’ll read
+    if (!buffer.EnsureCapacity(pReadParam->m_iSize))
+        return false;
 
+    auto pSendBuffer = buffer.Data();
     RtlZeroMemory(pSendBuffer, pReadParam->m_iSize);
 
     // Read data from target process memory
-    memory::ReadProcessVirtualMemory(reinterpret_cast<HANDLE>(pReadParam->m_procId),
-                                     reinterpret_cast<PVOID>(pReadParam->m_addr), pSendBuffer, pReadParam->m_iSize);
+    if (!memory::ReadProcessVirtualMemory(reinterpret_cast<HANDLE>(pReadParam->m_procId),
+                                          reinterpret_cast<PVOID>(pReadParam->m_addr), pSendBuffer,
+                                          pReadParam->m_iSize))
+        return false;
 
     // Send the size of the data and then the data
-    send(client_sockfd, &pReadParam->m_iSize, sizeof(size_t), 0);
-    send(client_sockfd, pSendBuffer, pReadParam->m_iSize, 0);
-
-    ExFreePoolWithTag(pSendBuffer, 'pac');
+    return SendAll(client_sockfd, &pReadParam->m_iSize, sizeof(pReadParam->m_iSize)) &&
+           SendAll(client_sockfd, pSendBuffer, pReadParam->m_iSize);
 }
 
 //--------------------------------------------------------------------------------------
-// WRITE operation handling
+// WRITE_FORCE operation handling
 //--------------------------------------------------------------------------------------
-static void HandleWriteOperation(ReadMemoryOperation* pWriteParam, int client_sockfd)
+static bool HandleForceWriteOperation(const ReadMemoryOperation* pWriteParam, int client_sockfd, ClientBuffer& buffer)
 {
-    // Allocate buffer to hold incoming data
-    auto pWriteBuffer = ExAllocatePoolWithTag(NonPagedPool, pWriteParam->m_iSize, 'pac');
-    if (!pWriteBuffer)
-        return;
+    // Reuse the connection buffer to hold incoming data
+    if (!buffer.EnsureCapacity(pWriteParam->m_iSize))
+        return false;
 
+    auto pWriteBuffer = buffer.Data();
     // Receive data that needs to be written to the target process memory
-    recv(client_sockfd, pWriteBuffer, pWriteParam->m_iSize, 0);
+    if (!ReceiveAll(client_sockfd, pWriteBuffer, pWriteParam->m_iSize))
+        return false;
 
     const bool bStatus =
-            memory::WriteProcessVirtualMemory(reinterpret_cast<HANDLE>(pWriteParam->m_procId), pWriteBuffer,
-                                              reinterpret_cast<PVOID>(pWriteParam->m_addr), pWriteParam->m_iSize);
+            memory::ForceWriteProcessVirtualMemory(reinterpret_cast<HANDLE>(pWriteParam->m_procId), pWriteBuffer,
+                                                   reinterpret_cast<PVOID>(pWriteParam->m_addr), pWriteParam->m_iSize);
 
     constexpr size_t szStatusSize = sizeof(bStatus);
 
-    send(client_sockfd, &szStatusSize, sizeof(szStatusSize), 0);
-    send(client_sockfd, &bStatus, 1, 0);
-
-    ExFreePoolWithTag(pWriteBuffer, 'pac');
+    return SendAll(client_sockfd, &szStatusSize, sizeof(szStatusSize)) &&
+           SendAll(client_sockfd, &bStatus, sizeof(bStatus));
 }
 
 //--------------------------------------------------------------------------------------
 // PROCESS_BASE operation handling
 //--------------------------------------------------------------------------------------
-static void HandleProcessBaseOperation(ReadMemoryOperation* pBaseParam, int client_sockfd)
+static bool HandleProcessBaseOperation(const ReadMemoryOperation* pBaseParam, int client_sockfd)
 {
     // Retrieve the base address of the target process's main module
     const auto procBase = memory::GetProcessModuleBase(reinterpret_cast<HANDLE>(pBaseParam->m_procId));
@@ -241,21 +305,20 @@ static void HandleProcessBaseOperation(ReadMemoryOperation* pBaseParam, int clie
     constexpr size_t baseSize = sizeof(procBase);
 
     // Send back the base address
-    send(client_sockfd, &baseSize, sizeof(size_t), 0);
-    send(client_sockfd, &procBase, sizeof(procBase), 0);
+    return SendAll(client_sockfd, &baseSize, sizeof(baseSize)) && SendAll(client_sockfd, &procBase, sizeof(procBase));
 }
 
 //--------------------------------------------------------------------------------------
 // MOUSE_MOVE_RELATIVE operation handling
 //--------------------------------------------------------------------------------------
-static void HandleMouseMoveRelativeOperation(MouseMoveRelativeOperation* pMoveParam, int client_sockfd)
+static bool HandleMouseMoveRelativeOperation(const MouseMoveRelativeOperation* pMoveParam, int client_sockfd)
 {
     const bool bStatus = mouse::MoveRelative(pMoveParam->m_x, pMoveParam->m_y);
 
     constexpr size_t szStatusSize = sizeof(bStatus);
 
-    send(client_sockfd, &szStatusSize, sizeof(szStatusSize), 0);
-    send(client_sockfd, &bStatus, 1, 0);
+    return SendAll(client_sockfd, &szStatusSize, sizeof(szStatusSize)) &&
+           SendAll(client_sockfd, &bStatus, sizeof(bStatus));
 }
 
 //--------------------------------------------------------------------------------------

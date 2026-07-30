@@ -1,0 +1,113 @@
+name: Draft Release Assets
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Tag of the existing draft release
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: draft-release-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  attach:
+    name: Build and attach ${{ inputs.release_tag }}
+    runs-on: windows-2022
+    timeout-minutes: 20
+
+    steps:
+      - name: Resolve draft release
+        id: release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          $releaseJson = gh release view $env:RELEASE_TAG `
+            --repo $env:GITHUB_REPOSITORY `
+            --json isDraft,tagName,targetCommitish
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Release '$env:RELEASE_TAG' was not found."
+          }
+
+          $release = $releaseJson | ConvertFrom-Json
+          if (-not $release.isDraft) {
+            throw "Release '$env:RELEASE_TAG' is not a draft."
+          }
+
+          "tag=$($release.tagName)" >> $env:GITHUB_OUTPUT
+          "target=$($release.targetCommitish)" >> $env:GITHUB_OUTPUT
+
+      - name: Check out draft target
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.release.outputs.target }}
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Configure and build Release
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          $visualStudio = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+
+          if (-not $visualStudio) {
+            throw "Visual Studio with the MSVC x64 toolchain was not found."
+          }
+
+          $devShell = Join-Path $visualStudio "Common7\Tools\Launch-VsDevShell.ps1"
+          & $devShell -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
+
+          cmake --preset windows-release
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+          cmake --build cmake-build/build/windows-release --parallel
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+      - name: Verify release assets
+        shell: pwsh
+        run: |
+          $assets = @(
+            "out/Release/plato.sys"
+            "out/Release/plato_client.lib"
+            "out/Release/plato_client_example.exe"
+          )
+
+          foreach ($asset in $assets) {
+            if (-not (Test-Path -LiteralPath $asset -PathType Leaf)) {
+              throw "Missing release asset: $asset"
+            }
+          }
+
+      - name: Attach assets to draft
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          $assets = @(
+            "out/Release/plato.sys"
+            "out/Release/plato_client.lib"
+            "out/Release/plato_client_example.exe"
+          )
+
+          gh release upload $env:RELEASE_TAG @assets `
+            --clobber `
+            --repo $env:GITHUB_REPOSITORY
+
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }

@@ -77,7 +77,13 @@ git push origin v1.0.0
 
 The produced driver is unsigned; the workflows do not load or deploy it.
 
-Workflow definitions are in `.github/workflows/ci.yml` and `.github/workflows/release.yml`.
+GitHub does not emit an Actions event when a draft release is saved. To attach binaries before publishing, save the
+draft, open **Actions**, select **Draft Release Assets**, choose **Run workflow**, and enter the draft's tag. The workflow
+verifies that the release is still a draft, builds its target commit, and uploads or replaces the three binary assets
+without publishing the release.
+
+Workflow definitions are in `.github/workflows/ci.yml`, `.github/workflows/release.yml`, and
+`.github/workflows/draft-release.yml`.
 
 ## C++ client library
 

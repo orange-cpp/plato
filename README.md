@@ -62,6 +62,23 @@ Generated artifacts are placed under `out/Debug` or `out/Release`:
 Building does not load or start the driver. Use an appropriate driver-development and test-signing environment. The
 current driver does not implement a controlled unload path.
 
+## CI/CD
+
+GitHub Actions CI runs for pushes to `main`, pull requests, and manual dispatches. It builds Debug and Release on the
+`windows-2022` runner and publishes the driver, client library, and example as separate workflow artifacts.
+
+Pushing a version tag builds the Release configuration and publishes the three binaries to the corresponding GitHub
+Release:
+
+```powershell
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+The produced driver is unsigned; the workflows do not load or deploy it.
+
+Workflow definitions are in `.github/workflows/ci.yml` and `.github/workflows/release.yml`.
+
 ## C++ client library
 
 Include the public header and link the CMake target:

@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build ${{ matrix.configuration }}
+    runs-on: windows-2022
+    timeout-minutes: 20
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - configuration: Debug
+            preset: windows-debug
+          - configuration: Release
+            preset: windows-release
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Configure and build
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          $visualStudio = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+
+          if (-not $visualStudio) {
+            throw "Visual Studio with the MSVC x64 toolchain was not found."
+          }
+
+          $devShell = Join-Path $visualStudio "Common7\Tools\Launch-VsDevShell.ps1"
+          & $devShell -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
+
+          cmake --preset "${{ matrix.preset }}"
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+          cmake --build "cmake-build/build/${{ matrix.preset }}" --parallel
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+      - name: Upload driver
+        uses: actions/upload-artifact@v7
+        with:
+          name: plato-driver-${{ matrix.configuration }}
+          path: out/${{ matrix.configuration }}/plato.sys
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload client library
+        uses: actions/upload-artifact@v7
+        with:
+          name: plato-client-${{ matrix.configuration }}
+          path: out/${{ matrix.configuration }}/plato_client.lib
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload example
+        uses: actions/upload-artifact@v7
+        with:
+          name: plato-example-${{ matrix.configuration }}
+          path: out/${{ matrix.configuration }}/plato_client_example.exe
+          if-no-files-found: error
+          retention-days: 14

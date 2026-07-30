@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercises plato's CR3-backed read/write operations against a test process."""
+"""Exercises plato's PML4-discovery read/write operations against a test process."""
 
 import argparse
 import socket
@@ -8,7 +8,7 @@ import sys
 
 
 OP_READ = 0
-OP_WRITE = 1
+OP_WRITE_FORCE = 1
 HOST = "127.0.0.1"
 PORT = 7653
 SIZE_T = struct.Struct("<Q")
@@ -40,8 +40,8 @@ def read_memory(sock: socket.socket, pid: int, address: int, size: int) -> bytes
     return response
 
 
-def write_memory(sock: socket.socket, pid: int, address: int, data: bytes) -> None:
-    send_request_header(sock, OP_WRITE, pid, address, len(data))
+def force_write_memory(sock: socket.socket, pid: int, address: int, data: bytes) -> None:
+    send_request_header(sock, OP_WRITE_FORCE, pid, address, len(data))
     sock.sendall(data)
 
     response_size = SIZE_T.unpack(recv_exact(sock, SIZE_T.size))[0]
@@ -57,6 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--size", type=int, default=64, help="buffer capacity printed by test_memory_target.py")
     parser.add_argument("--expected", default="Hello World", help="initial buffer contents")
     parser.add_argument("--replacement", default="Homework done", help="text to write into the buffer")
+    parser.add_argument("--timeout", type=float, default=120.0, help="socket timeout; the first physical scan is slow")
     return parser.parse_args()
 
 
@@ -72,8 +73,12 @@ def main() -> int:
         print("replacement including its NUL terminator does not fit in the target buffer", file=sys.stderr)
         return 2
 
-    with socket.create_connection((HOST, PORT), timeout=5.0) as sock:
-        sock.settimeout(5.0)
+    if args.timeout <= 0:
+        print("timeout must be positive", file=sys.stderr)
+        return 2
+
+    with socket.create_connection((HOST, PORT), timeout=args.timeout) as sock:
+        sock.settimeout(args.timeout)
 
         initial = read_memory(sock, args.pid, args.address, args.size)
         if initial[: len(expected)] != expected or initial[len(expected) : len(expected) + 1] != b"\0":
@@ -81,7 +86,7 @@ def main() -> int:
             return 1
         print(f"read: {initial.split(b'\0', 1)[0].decode('ascii')}")
 
-        write_memory(sock, args.pid, args.address, replacement)
+        force_write_memory(sock, args.pid, args.address, replacement)
         final = read_memory(sock, args.pid, args.address, args.size)
         if final[: len(replacement)] != replacement:
             print(f"write verification failed: {final!r}", file=sys.stderr)

@@ -9,6 +9,7 @@ namespace
     constexpr uint64_t kPageTableIndexMask = 0x1FF;
     constexpr uint64_t kPagePresent = 1;
     constexpr uint64_t kLargePage = 1ULL << 7;
+    constexpr ACCESS_MASK kProcessQueryInformation = 0x0400;
 
     // Four-level x64 paging reserves bits 12-51 of a page-table entry for the physical frame number.
     constexpr uint64_t kPhysicalPageMask = 0x000F'FFFF'FFFF'F000ULL;
@@ -90,6 +91,81 @@ namespace
     {
         const uint64_t upperBits = address >> 48;
         return upperBits == 0 || upperBits == 0xFFFF;
+    }
+
+    bool IsReadableProtection(ULONG protection)
+    {
+        if (protection & PAGE_GUARD)
+            return false;
+
+        switch (protection & 0xFF)
+        {
+            case PAGE_READONLY:
+            case PAGE_READWRITE:
+            case PAGE_WRITECOPY:
+            case PAGE_EXECUTE_READ:
+            case PAGE_EXECUTE_READWRITE:
+            case PAGE_EXECUTE_WRITECOPY:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    bool IsReadableUserRange(PEPROCESS process, PVOID address, SIZE_T size)
+    {
+        if (!process || !address || !size || KeGetCurrentIrql() != PASSIVE_LEVEL)
+            return false;
+
+        const auto rangeStart = reinterpret_cast<uintptr_t>(address);
+        const auto highestUserAddress = reinterpret_cast<uintptr_t>(MmHighestUserAddress);
+        if (rangeStart > highestUserAddress || size - 1 > highestUserAddress - rangeStart)
+            return false;
+
+        HANDLE processHandle = nullptr;
+        const NTSTATUS openStatus =
+                ObOpenObjectByPointer(process, OBJ_KERNEL_HANDLE, nullptr, kProcessQueryInformation, *PsProcessType,
+                                      KernelMode, &processHandle);
+        if (!NT_SUCCESS(openStatus))
+            return false;
+
+        const uintptr_t rangeEnd = rangeStart + size;
+        uintptr_t currentAddress = rangeStart;
+        bool readable = true;
+
+        while (currentAddress < rangeEnd)
+        {
+            MEMORY_BASIC_INFORMATION memoryInformation{};
+            const NTSTATUS queryStatus =
+                    ZwQueryVirtualMemory(processHandle, reinterpret_cast<PVOID>(currentAddress),
+                                         MemoryBasicInformation, &memoryInformation, sizeof(memoryInformation), nullptr);
+            if (!NT_SUCCESS(queryStatus) || memoryInformation.State != MEM_COMMIT ||
+                !IsReadableProtection(memoryInformation.Protect))
+            {
+                readable = false;
+                break;
+            }
+
+            const auto regionStart = reinterpret_cast<uintptr_t>(memoryInformation.BaseAddress);
+            if (!memoryInformation.RegionSize || regionStart > currentAddress ||
+                regionStart > UINTPTR_MAX - memoryInformation.RegionSize)
+            {
+                readable = false;
+                break;
+            }
+
+            const uintptr_t regionEnd = regionStart + memoryInformation.RegionSize;
+            if (regionEnd <= currentAddress)
+            {
+                readable = false;
+                break;
+            }
+
+            currentAddress = regionEnd < rangeEnd ? regionEnd : rangeEnd;
+        }
+
+        ZwClose(processHandle);
+        return readable;
     }
 
     bool ReadPhysicalMemory(uint64_t physicalAddress, void* buffer, SIZE_T size)
@@ -301,7 +377,7 @@ bool memory::ReadProcessVirtualMemory(HANDLE pid, PVOID address, PVOID buffer, S
     return copied;
 }
 
-bool memory::WriteProcessVirtualMemory(HANDLE pid, PVOID sourceAddr, PVOID targetAddr, SIZE_T size)
+bool memory::ForceWriteProcessVirtualMemory(HANDLE pid, PVOID sourceAddr, PVOID targetAddr, SIZE_T size)
 {
     if (!pid || !sourceAddr || !targetAddr || !size || size > kMaxTransferSize)
         return false;
@@ -312,7 +388,9 @@ bool memory::WriteProcessVirtualMemory(HANDLE pid, PVOID sourceAddr, PVOID targe
 
     LockedUserRange lockedRange;
     uint64_t pageTableRoot = 0;
-    const NTSTATUS status = lockedRange.Lock(process, targetAddr, size, IoWriteAccess);
+    const NTSTATUS status = IsReadableUserRange(process, targetAddr, size)
+                                    ? lockedRange.Lock(process, targetAddr, size, IoReadAccess)
+                                    : STATUS_ACCESS_DENIED;
     const bool copied = NT_SUCCESS(status) && FindPageTableRoot(lockedRange.GetMdl(), &pageTableRoot) &&
                         CopyTranslatedPhysicalMemory(pageTableRoot, reinterpret_cast<uintptr_t>(targetAddr), sourceAddr,
                                                      size, true);

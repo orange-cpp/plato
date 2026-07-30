@@ -8,7 +8,7 @@ typedef unsigned char uint8_t;
 enum class OPERATION
 {
     READ,
-    WRITE,
+    WRITE_FORCE,
     PROCESS_BASE,
     MOVE_MOUSE_RELATIVE,
 };
@@ -114,7 +114,7 @@ static bool SendAll(int client_sockfd, const void* buffer, size_t size)
 }
 
 static bool HandleReadOperation(const ReadMemoryOperation* pReadParam, int client_sockfd, ClientBuffer& buffer);
-static bool HandleWriteOperation(const ReadMemoryOperation* pWriteParam, int client_sockfd, ClientBuffer& buffer);
+static bool HandleForceWriteOperation(const ReadMemoryOperation* pWriteParam, int client_sockfd, ClientBuffer& buffer);
 static bool HandleProcessBaseOperation(const ReadMemoryOperation* pBaseParam, int client_sockfd);
 static bool HandleMouseMoveRelativeOperation(const MouseMoveRelativeOperation* pMoveParam, int client_sockfd);
 
@@ -197,7 +197,7 @@ static NTSTATUS HandleClientSocket(int client_sockfd)
         switch (packetHeader.m_iOperation)
         {
             case OPERATION::READ:
-            case OPERATION::WRITE:
+            case OPERATION::WRITE_FORCE:
             case OPERATION::PROCESS_BASE:
             {
                 if (szSizeOfPacket != sizeof(ReadMemoryOperation))
@@ -211,8 +211,8 @@ static NTSTATUS HandleClientSocket(int client_sockfd)
 
                 if (packet.m_iOperation == OPERATION::READ)
                     success = HandleReadOperation(&packet, client_sockfd, buffer);
-                else if (packet.m_iOperation == OPERATION::WRITE)
-                    success = HandleWriteOperation(&packet, client_sockfd, buffer);
+                else if (packet.m_iOperation == OPERATION::WRITE_FORCE)
+                    success = HandleForceWriteOperation(&packet, client_sockfd, buffer);
                 else
                     success = HandleProcessBaseOperation(&packet, client_sockfd);
                 break;
@@ -271,9 +271,9 @@ static bool HandleReadOperation(const ReadMemoryOperation* pReadParam, int clien
 }
 
 //--------------------------------------------------------------------------------------
-// WRITE operation handling
+// WRITE_FORCE operation handling
 //--------------------------------------------------------------------------------------
-static bool HandleWriteOperation(const ReadMemoryOperation* pWriteParam, int client_sockfd, ClientBuffer& buffer)
+static bool HandleForceWriteOperation(const ReadMemoryOperation* pWriteParam, int client_sockfd, ClientBuffer& buffer)
 {
     // Reuse the connection buffer to hold incoming data
     if (!buffer.EnsureCapacity(pWriteParam->m_iSize))
@@ -285,8 +285,8 @@ static bool HandleWriteOperation(const ReadMemoryOperation* pWriteParam, int cli
         return false;
 
     const bool bStatus =
-            memory::WriteProcessVirtualMemory(reinterpret_cast<HANDLE>(pWriteParam->m_procId), pWriteBuffer,
-                                              reinterpret_cast<PVOID>(pWriteParam->m_addr), pWriteParam->m_iSize);
+            memory::ForceWriteProcessVirtualMemory(reinterpret_cast<HANDLE>(pWriteParam->m_procId), pWriteBuffer,
+                                                   reinterpret_cast<PVOID>(pWriteParam->m_addr), pWriteParam->m_iSize);
 
     constexpr size_t szStatusSize = sizeof(bStatus);
 

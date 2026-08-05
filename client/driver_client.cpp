@@ -169,6 +169,9 @@ struct plato::DriverClient::Impl
         if (!ReceiveAll(&responseSize, sizeof(responseSize)))
             return false;
 
+        if (responseSize == 0)
+            return false;
+
         if (responseSize != expectedSize)
         {
             CloseSocket();

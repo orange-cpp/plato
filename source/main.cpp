@@ -263,7 +263,10 @@ static bool HandleReadOperation(const ReadMemoryOperation* pReadParam, int clien
     if (!memory::ReadProcessVirtualMemory(reinterpret_cast<HANDLE>(pReadParam->m_procId),
                                           reinterpret_cast<PVOID>(pReadParam->m_addr), pSendBuffer,
                                           pReadParam->m_iSize))
-        return false;
+    {
+        constexpr size_t responseSize = 0;
+        return SendAll(client_sockfd, &responseSize, sizeof(responseSize));
+    }
 
     // Send the size of the data and then the data
     return SendAll(client_sockfd, &pReadParam->m_iSize, sizeof(pReadParam->m_iSize)) &&
